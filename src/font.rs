@@ -1,8 +1,8 @@
 //! Custom TrueType & bitmap font helpers built on Horizon's `DrawContext::gui_paint`.
 //!
-//! Ships 4x-supersampled open-source TrueType fonts (`Geist`, `Geist Bold`, `Geist Mono`,
-//! `Bricolage`, `Pixelify`) under `assets/star/font/` and defaults to **`Geist`**
-//! (`Geist-Medium` body + `Geist-SemiBold` headers) for crisp modern UI typography.
+//! Ships 4x-supersampled TrueType fonts under `assets/star/font/`:
+//! `JetBrains Mono`, `Comfortaa`, `Tw Cen MT`, `Pixelation`, `Geist`, `Geist Bold`,
+//! `Geist Mono`, `Bricolage`, `Pixelify`, plus vanilla `Minecraft`.
 
 use mod_api::client::hud_layout::PoseOp;
 use mod_api::text::TextStyle;
@@ -11,6 +11,10 @@ use mod_api::{DrawContext, GuiDraw, Text};
 use crate::module::{ModuleId, ModuleManager};
 
 pub const FONT_PRESETS: &[&str] = &[
+    "JetBrains Mono",
+    "Comfortaa",
+    "Tw Cen MT",
+    "Pixelation",
     "Geist",
     "Geist Bold",
     "Geist Mono",
@@ -21,6 +25,10 @@ pub const FONT_PRESETS: &[&str] = &[
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FontFace {
+    JetBrainsMono,
+    Comfortaa,
+    TwCenMt,
+    Pixelation,
     Geist,
     GeistBold,
     GeistMono,
@@ -32,19 +40,26 @@ pub enum FontFace {
 impl FontFace {
     pub fn from_index(idx: usize) -> Self {
         match idx {
-            0 => Self::Geist,
-            1 => Self::GeistBold,
-            2 => Self::GeistMono,
-            3 => Self::Bricolage,
-            4 => Self::Pixelify,
-            5 => Self::Minecraft,
-            _ => Self::Geist,
+            0 => Self::JetBrainsMono,
+            1 => Self::Comfortaa,
+            2 => Self::TwCenMt,
+            3 => Self::Pixelation,
+            4 => Self::Geist,
+            5 => Self::GeistBold,
+            6 => Self::GeistMono,
+            7 => Self::Bricolage,
+            8 => Self::Pixelify,
+            9 => Self::Minecraft,
+            _ => Self::JetBrainsMono,
         }
     }
 
     pub fn font_id(self, bold: bool) -> Option<&'static str> {
         match self {
-            // Use the real SemiBold TrueType face for Geist headers instead of synthetic 1px doubling.
+            Self::JetBrainsMono => Some("star:jetbrains_mono"),
+            Self::Comfortaa => Some("star:comfortaa"),
+            Self::TwCenMt => Some("star:tw_cen_mt"),
+            Self::Pixelation => Some("star:pixelation"),
             Self::Geist if bold => Some("star:geist_semibold"),
             Self::Geist => Some("star:geist"),
             Self::GeistBold => Some("star:geist_semibold"),
@@ -64,6 +79,10 @@ impl FontFace {
     /// Approximate advance ratio relative to `minecraft:default` (`DrawContext::text_width`).
     pub fn width_ratio(self) -> f32 {
         match self {
+            Self::JetBrainsMono => 0.96,
+            Self::Comfortaa => 0.96,
+            Self::TwCenMt => 0.88,
+            Self::Pixelation => 0.98,
             Self::Geist => 0.90,
             Self::GeistBold => 0.93,
             Self::GeistMono => 0.98,
@@ -87,7 +106,7 @@ pub struct FontConfig {
 impl Default for FontConfig {
     fn default() -> Self {
         Self {
-            face: FontFace::Geist,
+            face: FontFace::JetBrainsMono,
             scale: 0.95,
             shadow: false,
             bold_headers: true,
@@ -106,6 +125,11 @@ impl FontConfig {
             bold_headers: gui.bool("bold_headers", true),
             italic_values: gui.bool("italic_values", false),
         }
+    }
+
+    /// Returns a copy with a different font face (used for live previews inside the Font dropdown).
+    pub fn with_face(self, face: FontFace) -> Self {
+        Self { face, ..self }
     }
 
     /// Returns a copy scaled by `factor` (e.g. for floating nametags).

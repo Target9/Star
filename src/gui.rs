@@ -11,7 +11,7 @@
 use mod_api::{ClientHost, DrawContext};
 
 use crate::entity_filter::{self, EntityGroup};
-use crate::font::FontConfig;
+use crate::font::{FontConfig, FontFace};
 use crate::module::{Category, ModuleId, ModuleManager};
 use crate::settings::{SettingKind, format_key_name};
 use crate::theme::{Theme, with_alpha};
@@ -62,6 +62,15 @@ enum PickerFilter {
     Group(EntityGroup),
 }
 
+/// Interactive state for an open floating dropdown popover (Font, Theme, Mode settings).
+#[derive(Clone, Copy, Debug)]
+struct DropdownState {
+    mod_idx: usize,
+    set_idx: usize,
+    anchor: [f32; 4],
+    scroll: f32,
+}
+
 /// Persistent interactive state for the ClickGUI while the mod screen is open.
 #[derive(Debug)]
 pub struct ClickGuiState {
@@ -74,6 +83,7 @@ pub struct ClickGuiState {
     dragging: Option<DragTarget>,
     listening_bind: Option<BindTarget>,
     entity_picker: Option<EntityPickerState>,
+    open_dropdown: Option<DropdownState>,
     settings_scroll: f32,
     hud_scroll: f32,
     hits: Vec<HitRegion>,
@@ -81,6 +91,7 @@ pub struct ClickGuiState {
     card_scroll_rect: Option<([f32; 4], f32)>,
     picker_list_rect: Option<([f32; 4], f32)>,
     picker_window_rect: Option<[f32; 4]>,
+    dropdown_list_rect: Option<([f32; 4], f32)>,
     hovered_tooltip: Option<String>,
 }
 
@@ -96,6 +107,7 @@ impl Default for ClickGuiState {
             dragging: None,
             listening_bind: None,
             entity_picker: None,
+            open_dropdown: None,
             settings_scroll: 0.0,
             hud_scroll: 0.0,
             hits: Vec::new(),
@@ -103,6 +115,7 @@ impl Default for ClickGuiState {
             card_scroll_rect: None,
             picker_list_rect: None,
             picker_window_rect: None,
+            dropdown_list_rect: None,
             hovered_tooltip: None,
         }
     }
@@ -156,7 +169,8 @@ enum HitKind {
     ToggleModuleEnabled(usize),
     SettingBool { mod_idx: usize, set_idx: usize },
     SettingSlider { mod_idx: usize, set_idx: usize },
-    SettingMode { mod_idx: usize, set_idx: usize },
+    SettingMode { mod_idx: usize, set_idx: usize, anchor: [f32; 4] },
+    DropdownOption { mod_idx: usize, set_idx: usize, option_idx: usize },
     SettingColorHeader { mod_idx: usize, set_idx: usize },
     SettingColorChannel { mod_idx: usize, set_idx: usize, channel: u8 },
     SettingKeybind { mod_idx: usize, set_idx: usize },
@@ -182,6 +196,7 @@ impl ClickGuiState {
         self.listening_bind = None;
         self.search_focused = false;
         self.entity_picker = None;
+        self.open_dropdown = None;
     }
 
     /// Renders the entire ClickGUI and rebuilds interactive hit regions for the frame.
@@ -226,10 +241,11 @@ impl ClickGuiState {
         self.card_scroll_rect = None;
         self.picker_list_rect = None;
         self.picker_window_rect = None;
+        self.dropdown_list_rect = None;
         self.hovered_tooltip = None;
 
-        // When the Entity Picker modal is open, ignore hover on background elements.
-        let bg_mouse = if self.entity_picker.is_some() {
+        // When a modal or dropdown popover is open, suppress hover on background elements.
+        let bg_mouse = if self.entity_picker.is_some() || self.open_dropdown.is_some() {
             [-9999.0, -9999.0]
         } else {
             mouse
@@ -282,6 +298,8 @@ impl ClickGuiState {
             // Clear background hits so modal captures all interactions cleanly.
             self.hits.clear();
             self.render_entity_picker(draw, size, mouse, manager, &theme, font);
+        } else if self.open_dropdown.is_some() {
+            self.render_dropdown(draw, size, mouse, manager, &theme, font);
         } else if show_tooltips {
             let tip = self.hovered_tooltip.clone().or_else(|| {
                 self.hits
@@ -1044,10 +1062,42 @@ impl ClickGuiState {
                         if hover {
                             draw.fill(row_rect, theme.module_hover);
                         }
-                        let val_str = format!("< {} >", setting.display_value());
-                        let vw = font.width(draw, &val_str, false);
-                        let val_x = (px + w - 7.0 - vw).max(px + w * 0.45);
-                        let label_max = (val_x - (px + 10.0)).max(20.0);
+                        let is_open = self
+                            .open_dropdown
+                            .is_some_and(|d| d.mod_idx == mod_idx && d.set_idx == set_idx);
+                        let val = setting.display_value();
+                        let chevron = if is_open { "^" } else { "v" };
+                        let vw = font.width(draw, &val, false);
+                        let cw = font.width(draw, chevron, false);
+                        let pill_w = (vw + cw + 14.0).clamp(52.0, (w * 0.58).max(52.0));
+                        let pill_h = SETTING_H - 3.5;
+                        let pill_x = px + w - pill_w - 6.0;
+                        let pill_y = y + 1.75;
+                        let pill_rect = [pill_x, pill_y, pill_w, pill_h];
+
+                        if is_open
+                            && let Some(dd) = &mut self.open_dropdown
+                        {
+                            dd.anchor = pill_rect;
+                        }
+
+                        draw.fill(
+                            pill_rect,
+                            if is_open {
+                                with_alpha(theme.accent, 0x38)
+                            } else if hover {
+                                theme.module_hover
+                            } else {
+                                theme.slider_track
+                            },
+                        );
+                        draw_outline(
+                            draw,
+                            pill_rect,
+                            if is_open { theme.accent } else { theme.border },
+                        );
+
+                        let label_max = (pill_x - (px + 10.0)).max(20.0);
                         font.draw_fitted(
                             draw,
                             setting.name,
@@ -1057,19 +1107,35 @@ impl ClickGuiState {
                             false,
                             false,
                         );
+                        let pty = font.center_y(pill_y, pill_h);
+                        let val_max = (pill_w - cw - 11.0).max(16.0);
                         font.draw_fitted(
                             draw,
-                            &val_str,
-                            [val_x, ty],
-                            (px + w - 7.0 - val_x).max(16.0),
-                            theme.accent,
+                            &val,
+                            [pill_x + 4.5, pty],
+                            val_max,
+                            if is_open { theme.text } else { theme.accent },
                             false,
                             font.italic_values,
+                        );
+                        font.draw_body(
+                            draw,
+                            chevron,
+                            [pill_x + pill_w - cw - 4.0, pty],
+                            if is_open {
+                                theme.accent
+                            } else {
+                                theme.text_muted
+                            },
                         );
                         if let Some(hit) = intersect_rects(row_rect, clip) {
                             self.hits.push(HitRegion {
                                 rect: hit,
-                                kind: HitKind::SettingMode { mod_idx, set_idx },
+                                kind: HitKind::SettingMode {
+                                    mod_idx,
+                                    set_idx,
+                                    anchor: pill_rect,
+                                },
                                 tooltip: Some(setting.description.to_owned()),
                             });
                         }
@@ -1248,6 +1314,151 @@ impl ClickGuiState {
         }
 
         y
+    }
+
+    /// Renders the floating dropdown menu for any open `SettingKind::Mode` control.
+    /// For `font_face`, each option previews itself in its own TrueType font face!
+    fn render_dropdown(
+        &mut self,
+        draw: &mut dyn DrawContext,
+        size: [f32; 2],
+        mouse: [f32; 2],
+        manager: &ModuleManager,
+        theme: &Theme,
+        font: FontConfig,
+    ) {
+        let Some(dd) = self.open_dropdown else {
+            return;
+        };
+        let Some(module) = manager.modules.get(dd.mod_idx) else {
+            self.open_dropdown = None;
+            return;
+        };
+        let Some(setting) = module.settings.get(dd.set_idx) else {
+            self.open_dropdown = None;
+            return;
+        };
+        let SettingKind::Mode {
+            index: selected,
+            options,
+            ..
+        } = &setting.kind
+        else {
+            self.open_dropdown = None;
+            return;
+        };
+        if options.is_empty() {
+            self.open_dropdown = None;
+            return;
+        }
+
+        let is_font_dropdown = setting.id == "font_face";
+        let item_h = 15.5;
+        let max_opt_w = options
+            .iter()
+            .enumerate()
+            .map(|(i, opt)| {
+                let preview_font = if is_font_dropdown {
+                    font.with_face(FontFace::from_index(i))
+                } else {
+                    font
+                };
+                preview_font.width(draw, opt, false)
+            })
+            .fold(0.0_f32, f32::max);
+
+        let drop_w = (max_opt_w + 22.0).max(dd.anchor[2]).min(size[0] - 16.0);
+        let content_h = options.len() as f32 * item_h + 4.0;
+        let space_below = (size[1] - FOOTER_H - 8.0 - (dd.anchor[1] + dd.anchor[3])).max(0.0);
+        let space_above = (dd.anchor[1] - (TOP_BAR_H + 8.0)).max(0.0);
+        let open_above = space_below < content_h.min(130.0) && space_above > space_below;
+        let max_h = if open_above {
+            space_above.min(180.0)
+        } else {
+            space_below.min(180.0)
+        }
+        .max(item_h + 4.0);
+        let drop_h = content_h.min(max_h);
+        let max_scroll = (content_h - drop_h).max(0.0);
+        let scroll = dd.scroll.clamp(0.0, max_scroll);
+        if let Some(st) = &mut self.open_dropdown {
+            st.scroll = scroll;
+        }
+
+        let drop_x = (dd.anchor[0] + dd.anchor[2] - drop_w).clamp(6.0, (size[0] - drop_w - 6.0).max(6.0));
+        let drop_y = if open_above {
+            (dd.anchor[1] - drop_h - 1.0).max(TOP_BAR_H + 4.0)
+        } else {
+            dd.anchor[1] + dd.anchor[3] + 1.0
+        };
+        let drop_rect = [drop_x, drop_y, drop_w, drop_h];
+        self.dropdown_list_rect = Some((drop_rect, max_scroll));
+
+        // Shadow & container
+        draw.fill([drop_x + 2.0, drop_y + 2.0, drop_w, drop_h], 0x6800_0000);
+        draw.fill(drop_rect, with_alpha(theme.header_bg, 0xFC));
+
+        let clipped = draw.push_clip(drop_rect).is_ok();
+        for (opt_idx, opt) in options.iter().enumerate() {
+            let iy = drop_y + 2.0 + opt_idx as f32 * item_h - scroll;
+            if iy + item_h < drop_y || iy > drop_y + drop_h {
+                continue;
+            }
+            let row = [drop_x + 1.0, iy, drop_w - 2.0, item_h];
+            let hover = rect_contains(drop_rect, mouse) && rect_contains(row, mouse);
+            let is_selected = opt_idx == *selected;
+
+            if is_selected {
+                draw.fill(row, with_alpha(theme.accent, if hover { 0x4C } else { 0x34 }));
+                draw.fill([drop_x + 1.0, iy, 2.0, item_h], theme.accent);
+            } else if hover {
+                draw.fill(row, theme.module_hover);
+            }
+
+            let preview_font = if is_font_dropdown {
+                font.with_face(FontFace::from_index(opt_idx))
+            } else {
+                font
+            };
+            let ty = preview_font.center_y(iy, item_h);
+            preview_font.draw_fitted(
+                draw,
+                opt,
+                [drop_x + 7.0, ty],
+                drop_w - 14.0,
+                if is_selected || hover {
+                    theme.text
+                } else {
+                    theme.text_muted
+                },
+                false,
+                false,
+            );
+
+            if let Some(hit) = intersect_rects(row, drop_rect) {
+                self.hits.push(HitRegion {
+                    rect: hit,
+                    kind: HitKind::DropdownOption {
+                        mod_idx: dd.mod_idx,
+                        set_idx: dd.set_idx,
+                        option_idx: opt_idx,
+                    },
+                    tooltip: None,
+                });
+            }
+        }
+        if clipped {
+            let _ = draw.pop_clip();
+        }
+
+        if max_scroll > 0.5 {
+            let track_x = drop_x + drop_w - 3.0;
+            let thumb_h = ((drop_h / content_h) * drop_h).clamp(12.0, drop_h);
+            let thumb_y = drop_y + (scroll / max_scroll) * (drop_h - thumb_h);
+            draw.fill([track_x, thumb_y, 2.0, thumb_h], with_alpha(theme.accent, 0xCC));
+        }
+
+        draw_outline(draw, drop_rect, theme.accent);
     }
 
     /// Renders the floating Entity Selector modal window for picking exact entity types.
@@ -1729,6 +1940,9 @@ impl ClickGuiState {
 
         let Some(hit) = hit else {
             self.listening_bind = None;
+            if self.open_dropdown.take().is_some() {
+                return true;
+            }
             // Clicking outside the Entity Picker modal closes it cleanly.
             if let Some(win) = self.picker_window_rect
                 && !rect_contains(win, mouse)
@@ -1739,12 +1953,27 @@ impl ClickGuiState {
             return false;
         };
 
+        // If a dropdown is open and the user clicks something other than its own options or anchor, close it.
+        if let Some(dd) = self.open_dropdown {
+            let is_own = matches!(
+                hit.kind,
+                HitKind::DropdownOption { mod_idx, set_idx, .. }
+                | HitKind::SettingMode { mod_idx, set_idx, .. }
+                    if mod_idx == dd.mod_idx && set_idx == dd.set_idx
+            );
+            if !is_own {
+                self.open_dropdown = None;
+                return true;
+            }
+        }
+
         match hit.kind {
             HitKind::Tab(tab) => {
                 if button == 0 {
                     self.active_tab = tab;
                     self.listening_bind = None;
                     self.dragging = None;
+                    self.open_dropdown = None;
                 }
                 true
             }
@@ -1861,18 +2090,47 @@ impl ClickGuiState {
                 }
                 true
             }
-            HitKind::SettingMode { mod_idx, set_idx } => {
-                let setting = &mut manager.modules[mod_idx].settings[set_idx];
-                if let SettingKind::Mode { index, options, .. } = &mut setting.kind
-                    && !options.is_empty()
-                {
-                    if button == 0 {
-                        *index = (*index + 1) % options.len();
-                        manager.dirty = true;
-                    } else if button == 1 {
-                        *index = (*index + options.len() - 1) % options.len();
+            HitKind::SettingMode {
+                mod_idx,
+                set_idx,
+                anchor,
+            } => {
+                if button == 0 {
+                    let already_open = self
+                        .open_dropdown
+                        .is_some_and(|d| d.mod_idx == mod_idx && d.set_idx == set_idx);
+                    if already_open {
+                        self.open_dropdown = None;
+                    } else {
+                        self.open_dropdown = Some(DropdownState {
+                            mod_idx,
+                            set_idx,
+                            anchor,
+                            scroll: 0.0,
+                        });
+                    }
+                } else if button == 1 {
+                    self.open_dropdown = None;
+                    if manager.modules[mod_idx].settings[set_idx].reset() {
                         manager.dirty = true;
                     }
+                }
+                true
+            }
+            HitKind::DropdownOption {
+                mod_idx,
+                set_idx,
+                option_idx,
+            } => {
+                if button == 0 {
+                    let setting = &mut manager.modules[mod_idx].settings[set_idx];
+                    if let SettingKind::Mode { index, options, .. } = &mut setting.kind
+                        && option_idx < options.len()
+                    {
+                        *index = option_idx;
+                        manager.dirty = true;
+                    }
+                    self.open_dropdown = None;
                 }
                 true
             }
@@ -2074,6 +2332,16 @@ impl ClickGuiState {
             return false;
         }
 
+        // Scroll inside open Dropdown popover first
+        if let Some((rect, max_scroll)) = self.dropdown_list_rect
+            && let Some(dd) = &mut self.open_dropdown
+        {
+            if rect_contains(rect, mouse) && max_scroll > 0.5 {
+                dd.scroll = (dd.scroll - scroll_y as f32 * 18.0).clamp(0.0, max_scroll);
+            }
+            return true;
+        }
+
         // Scroll inside Entity Picker list when open
         if let Some((rect, max_scroll)) = self.picker_list_rect
             && let Some(p) = &mut self.entity_picker
@@ -2147,6 +2415,12 @@ impl ClickGuiState {
                     }
                 }
             }
+            return true;
+        }
+
+        // Close open Dropdown on ESC
+        if self.open_dropdown.is_some() && key == "key.keyboard.escape" {
+            self.open_dropdown = None;
             return true;
         }
 
