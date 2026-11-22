@@ -20,8 +20,8 @@ pub fn load(host: &dyn ClientHost, manager: &mut ModuleManager) {
     let Ok(text) = std::str::from_utf8(&bytes) else {
         return;
     };
-    deserialize(text, manager);
-    manager.dirty = false;
+    let migrated = deserialize(text, manager);
+    manager.dirty = migrated;
 }
 
 pub fn save(host: &dyn ClientHost, manager: &mut ModuleManager) {
@@ -38,7 +38,7 @@ pub fn save(host: &dyn ClientHost, manager: &mut ModuleManager) {
 }
 
 pub fn serialize(manager: &ModuleManager) -> String {
-    let mut out = String::from("# Star configuration\n\n");
+    let mut out = String::from("# Star configuration\n# format=2\n\n");
 
     for cat in Category::ALL {
         let p = manager.panels[cat.index()];
@@ -74,10 +74,21 @@ pub fn serialize(manager: &ModuleManager) -> String {
     out
 }
 
-pub fn deserialize(text: &str, manager: &mut ModuleManager) {
+/// Loads configuration text into `manager`. Returns `true` if a legacy config
+/// was migrated so callers can persist the upgraded file.
+pub fn deserialize(text: &str, manager: &mut ModuleManager) -> bool {
+    let mut format_version: u32 = 1;
     for raw_line in text.lines() {
         let line = raw_line.trim();
-        if line.is_empty() || line.starts_with('#') {
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(comment) = line.strip_prefix('#') {
+            if let Some(ver) = comment.trim().strip_prefix("format=")
+                && let Ok(v) = ver.trim().parse::<u32>()
+            {
+                format_version = v;
+            }
             continue;
         }
         let Some((key, val)) = line.split_once('=') else {
@@ -148,6 +159,18 @@ pub fn deserialize(text: &str, manager: &mut ModuleManager) {
             setting.deserialize_value(val);
         }
     }
+
+    // Migrate old v1 default `font_scale=0.95` to native crisp `1.00` once.
+    let mut migrated = false;
+    if format_version < 2
+        && let Some(gui) = manager.by_key_mut("click_gui")
+        && (gui.float("font_scale", 1.0) - 0.95).abs() < 1e-4
+        && let Some(scale_setting) = gui.setting_mut("font_scale")
+    {
+        scale_setting.deserialize_value("1.0");
+        migrated = true;
+    }
+    migrated
 }
 
 #[cfg(test)]

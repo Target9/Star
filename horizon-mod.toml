@@ -1,6 +1,6 @@
 id = "star"
 name = "Star"
-version = "0.2.3"
+version = "0.2.4"
 description = "Meteor-inspired modular client with top-tab ClickGUI, font & theme customization, Entity Selector, Aim Assist, ESP, Tracers, Nametags, and visuals."
 authors = ["Target9"]
 license = "MIT"

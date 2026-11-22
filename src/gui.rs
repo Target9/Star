@@ -374,14 +374,14 @@ impl ClickGuiState {
 
         // Brand title on left
         let title = "STAR";
-        let ver = "v0.2";
+        let ver = concat!("v", env!("CARGO_PKG_VERSION"));
         let ty = font.center_y(0.0, TOP_BAR_H - 1.0);
         font.draw_header(draw, title, [10.0, ty], theme.accent);
         let title_w = font.width(draw, title, font.bold_headers);
-        font.draw_body(draw, ver, [14.0 + title_w, ty], theme.text_muted);
+        font.draw_body(draw, ver, [15.0 + title_w, ty], theme.text_muted);
 
         // Top navigation tabs directly in the top bar: Modules | Settings | HUD
-        let mut tab_x = 14.0 + title_w + font.width(draw, ver, false) + 14.0;
+        let mut tab_x = 15.0 + title_w + font.width(draw, ver, false) + 14.0;
         let tab_h = TOP_BAR_H - 5.0;
         let tab_y = 2.5;
         for tab in GuiTab::ALL {
@@ -423,7 +423,8 @@ impl ClickGuiState {
         // Modules tab controls on right: Search box + Reset Layout
         if self.active_tab == GuiTab::Modules {
             let reset_label = "Reset Layout";
-            let reset_w = font.width(draw, reset_label, false) + 12.0;
+            let reset_text_w = font.width(draw, reset_label, false);
+            let reset_w = reset_text_w + 14.0;
             let reset_h = 15.0;
             let reset_x = w - reset_w - 8.0;
             let reset_y = (TOP_BAR_H - reset_h) * 0.5 - 0.5;
@@ -441,7 +442,10 @@ impl ClickGuiState {
             font.draw_body(
                 draw,
                 reset_label,
-                [reset_x + 6.0, font.center_y(reset_y, reset_h)],
+                [
+                    reset_x + (reset_w - reset_text_w) * 0.5,
+                    font.center_y(reset_y, reset_h),
+                ],
                 if reset_hover {
                     theme.text
                 } else {

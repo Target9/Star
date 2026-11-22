@@ -366,11 +366,11 @@ fn build_click_gui_module() -> Module {
             Setting::float(
                 "font_scale",
                 "Font Scale",
-                "Global text size multiplier for crisp, uncluttered readability.",
+                "Global text size multiplier (1.00x is native 1:1 sharpness).",
                 0.70,
-                1.20,
+                1.25,
                 0.05,
-                0.95,
+                1.00,
             )
             .suffix("x"),
             Setting::bool(

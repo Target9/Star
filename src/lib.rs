@@ -6,6 +6,7 @@
 mod config;
 mod entity_filter;
 mod font;
+mod font_metrics;
 mod gui;
 mod hud;
 mod module;
