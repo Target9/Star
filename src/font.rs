@@ -1,7 +1,8 @@
-//! Custom font & typography helpers built on Horizon's `DrawContext::gui_paint`.
+//! Custom TrueType & bitmap font helpers built on Horizon's `DrawContext::gui_paint`.
 //!
-//! Defaults to Minecraft's smooth thin `minecraft:uniform` font at `0.90x` scale
-//! so panels and HUD overlays stay crisp and uncluttered.
+//! Ships 4x-supersampled open-source TrueType fonts (`Geist`, `Geist Bold`, `Geist Mono`,
+//! `Bricolage`, `Pixelify`) under `assets/star/font/` and defaults to **`Geist`**
+//! (`Geist-Medium` body + `Geist-SemiBold` headers) for crisp modern UI typography.
 
 use mod_api::client::hud_layout::PoseOp;
 use mod_api::text::TextStyle;
@@ -9,43 +10,66 @@ use mod_api::{DrawContext, GuiDraw, Text};
 
 use crate::module::{ModuleId, ModuleManager};
 
-pub const FONT_PRESETS: &[&str] = &["Smooth", "Minecraft", "Illager", "Galactic"];
+pub const FONT_PRESETS: &[&str] = &[
+    "Geist",
+    "Geist Bold",
+    "Geist Mono",
+    "Bricolage",
+    "Pixelify",
+    "Minecraft",
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FontFace {
-    Smooth,
+    Geist,
+    GeistBold,
+    GeistMono,
+    Bricolage,
+    Pixelify,
     Minecraft,
-    Illager,
-    Galactic,
 }
 
 impl FontFace {
     pub fn from_index(idx: usize) -> Self {
         match idx {
-            0 => Self::Smooth,
-            1 => Self::Minecraft,
-            2 => Self::Illager,
-            3 => Self::Galactic,
-            _ => Self::Smooth,
+            0 => Self::Geist,
+            1 => Self::GeistBold,
+            2 => Self::GeistMono,
+            3 => Self::Bricolage,
+            4 => Self::Pixelify,
+            5 => Self::Minecraft,
+            _ => Self::Geist,
         }
     }
 
-    pub fn font_id(self) -> Option<&'static str> {
+    pub fn font_id(self, bold: bool) -> Option<&'static str> {
         match self {
-            Self::Smooth => Some("minecraft:uniform"),
+            // Use the real SemiBold TrueType face for Geist headers instead of synthetic 1px doubling.
+            Self::Geist if bold => Some("star:geist_semibold"),
+            Self::Geist => Some("star:geist"),
+            Self::GeistBold => Some("star:geist_semibold"),
+            Self::GeistMono => Some("star:geist_mono"),
+            Self::Bricolage => Some("star:bricolage"),
+            Self::Pixelify => Some("star:pixelify"),
             Self::Minecraft => None,
-            Self::Illager => Some("minecraft:illageralt"),
-            Self::Galactic => Some("minecraft:alt"),
         }
+    }
+
+    /// True when bold weight is already provided by a dedicated TrueType face
+    /// so we shouldn't apply Minecraft's synthetic 1px double-draw bold.
+    pub fn uses_real_bold_face(self) -> bool {
+        matches!(self, Self::Geist | Self::GeistBold)
     }
 
     /// Approximate advance ratio relative to `minecraft:default` (`DrawContext::text_width`).
     pub fn width_ratio(self) -> f32 {
         match self {
-            Self::Smooth => 0.84,
+            Self::Geist => 0.90,
+            Self::GeistBold => 0.93,
+            Self::GeistMono => 0.98,
+            Self::Bricolage => 0.92,
+            Self::Pixelify => 0.95,
             Self::Minecraft => 1.0,
-            Self::Illager => 1.0,
-            Self::Galactic => 1.0,
         }
     }
 }
@@ -63,8 +87,8 @@ pub struct FontConfig {
 impl Default for FontConfig {
     fn default() -> Self {
         Self {
-            face: FontFace::Smooth,
-            scale: 0.90,
+            face: FontFace::Geist,
+            scale: 0.95,
             shadow: false,
             bold_headers: true,
             italic_values: false,
@@ -77,14 +101,14 @@ impl FontConfig {
         let gui = manager.get(ModuleId::ClickGui);
         Self {
             face: FontFace::from_index(gui.mode("font_face", 0)),
-            scale: (gui.float("font_scale", 0.90) as f32).clamp(0.65, 1.35),
+            scale: (gui.float("font_scale", 0.95) as f32).clamp(0.65, 1.35),
             shadow: gui.bool("font_shadow", false),
             bold_headers: gui.bool("bold_headers", true),
             italic_values: gui.bool("italic_values", false),
         }
     }
 
-    /// Returns a copy scaled by `factor` (e.g. for HUD badges or floating nametags).
+    /// Returns a copy scaled by `factor` (e.g. for floating nametags).
     pub fn scaled(self, factor: f32) -> Self {
         Self {
             scale: (self.scale * factor).clamp(0.50, 2.0),
@@ -108,8 +132,10 @@ impl FontConfig {
             return 0.0;
         }
         let base = draw.text_width(text);
-        let bold_extra = if bold {
+        let bold_extra = if bold && !self.face.uses_real_bold_face() {
             text.chars().count() as f32 * 0.65
+        } else if bold {
+            text.chars().count() as f32 * 0.18
         } else {
             0.0
         };
@@ -141,10 +167,10 @@ impl FontConfig {
 
         let mut component = Text::literal(text);
         let mut style = TextStyle::default();
-        if let Some(font_id) = self.face.font_id() {
+        if let Some(font_id) = self.face.font_id(bold) {
             style.font = Some(font_id.to_owned());
         }
-        if bold {
+        if bold && !self.face.uses_real_bold_face() {
             style.bold = Some(true);
         }
         if italic {

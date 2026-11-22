@@ -5,7 +5,7 @@ A Meteor-inspired modular client mod for [Horizon](https://github.com/horizon-ru
 ## Features
 
 - **Top-Bar Navigation ClickGUI** (`Right Shift` by default): switch cleanly between **`Modules`** (`Combat`, `Player`, `Movement`, `Render`), **`Settings`** (theme, font, layout, colors, keybind), and **`HUD`** directly from the top bar.
-- **Font & Theme Customization**: defaults to the sleek thin **`Smooth`** (`minecraft:uniform`) font at `0.90x` scale with options for `Smooth`, `Minecraft`, `Illager`, `Galactic`, font scale (`0.70x–1.20x`), text shadow, bold headers, italic values, 6 themes + custom RGBA pickers, and Rainbow Accent.
+- **Font & Theme Customization**: bundles 4×-supersampled TrueType fonts (`Geist` default, `Geist Bold`, `Geist Mono`, `Bricolage`, `Pixelify`, plus `Minecraft`), font scale (`0.70x–1.20x`), text shadow, bold headers (using real `Geist-SemiBold`), italic values, 6 themes + custom RGBA pickers, and Rainbow Accent.
 - **Reusable Entity Selector Window**: pick exact Minecraft entity types (loaded dynamically from `minecraft:entity_type`) with live search, group quick-toggles (`Players`, `Hostile`, `Neutral`, `Passive`, `Misc`), and a 2-column checklist. Used by **Aim Assist**, **ESP**, **Tracers**, and **Nametags**.
 - **Combat**: **Aim Assist** with exact Entity Selector targeting, activation modes, range, FOV, priority, aim point, block raycast line-of-sight, per-frame/per-tick smoothing, deadzone, and movement lead.
 - **Render / Visuals**:

@@ -370,7 +370,7 @@ fn build_click_gui_module() -> Module {
                 0.70,
                 1.20,
                 0.05,
-                0.90,
+                0.95,
             )
             .suffix("x"),
             Setting::bool(
