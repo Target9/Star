@@ -14,12 +14,11 @@ mod theme;
 use std::sync::{Mutex, OnceLock};
 
 use mod_api::{
-    self, ClientHost, ClientSetupEvent, ClientTickPreEvent, Flow, HostSide, InputKeyEvent,
-    KeyAction, KeyConflictContext, KeyRegistration, PlayerBreakSpeedEvent, Registrar,
-    RegistrationContext, RenderFramePreEvent, RenderGuiPostEvent, ScreenCharTypedPreEvent,
-    ScreenClosingEvent, ScreenKeyPressedPreEvent, ScreenMouseButtonPressedPreEvent,
-    ScreenMouseButtonReleasedPreEvent, ScreenMouseDraggedPreEvent, ScreenMouseScrolledPreEvent,
-    ScreenRenderPostEvent, SettingSpec,
+    self, ClientHost, ClientTickPreEvent, Flow, HostSide, InputKeyEvent, KeyAction,
+    KeyConflictContext, KeyRegistration, PlayerBreakSpeedEvent, Registrar, RegistrationContext,
+    RenderFramePreEvent, RenderGuiPostEvent, ScreenCharTypedPreEvent, ScreenClosingEvent,
+    ScreenKeyPressedPreEvent, ScreenMouseButtonPressedPreEvent, ScreenMouseButtonReleasedPreEvent,
+    ScreenMouseDraggedPreEvent, ScreenMouseScrolledPreEvent, ScreenRenderPostEvent, SettingSpec,
 };
 
 use crate::gui::ClickGuiState;
@@ -78,13 +77,6 @@ impl mod_api::Hooks for Mod {
                 .category("star.category.keys")
                 .context(KeyConflictContext::Universal),
         );
-    }
-
-    fn client_setup(&self, host: &mut dyn ClientHost, _: &mut ClientSetupEvent) {
-        let mut st = lock_state();
-        if !st.manager.config_loaded {
-            config::load(host, &mut st.manager);
-        }
     }
 
     fn input_key(&self, host: &mut dyn ClientHost, event: &mut InputKeyEvent<'_>) {
