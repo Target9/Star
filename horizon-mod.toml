@@ -1,0 +1,14 @@
+id = "star"
+name = "Star"
+version = "0.1.0"
+description = "Meteor-inspired modular client with categorized ClickGUI, theme customization, HUD, and Aim Assist."
+authors = ["Target9"]
+license = "MIT"
+api = "0.2"
+side = "client"
+capabilities = ["registries"]
+
+[native]
+game = "26.3"
+horizon = "2b77287de099c9316278ba7ac4d83590fdb7ef30"
+mixins = "e59da9094f0c2fdda6c627fe9eff22dec6a906f0"
