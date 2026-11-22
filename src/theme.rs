@@ -13,6 +13,7 @@ pub const THEME_PRESETS: &[&str] = &[
 ];
 
 /// Resolved visual palette and sizing parameters read each frame by the ClickGUI and HUD.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 pub struct Theme {
     pub accent: u32,

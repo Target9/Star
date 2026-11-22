@@ -4,11 +4,20 @@ A Meteor-inspired modular client mod for [Horizon](https://github.com/horizon-ru
 
 ## Features
 
-- **Categorized ClickGUI** (`Right Shift` by default): draggable, collapsible, scrollable category panels (`Combat`, `Player`, `Movement`, `Render`, `Client`), live search bar, reset layout, hover tooltips, inline per-module setting drawers, and keybind capture.
-- **Full Theme & HUD Customization**: 6 built-in themes (`Meteor`, `Midnight`, `Crimson`, `Emerald`, `Sunset`, `Monochrome`), custom RGBA accent/panel colors, Rainbow Accent mode, watermark, active modules ArrayList, target reticle, FOV ring, and target info card.
-- **Aim Assist**: players/mobs/invisible target filtering, `Always` / `Attack Held` / `Use Held` activation, configurable range, FOV, target priority (`FOV`, `Distance`, `Health`, `Hurt Time`), aim point (`Eyes`, `Chest`, `Center`, `Nearest`), block line-of-sight raycast, per-frame or per-tick smoothing (`Ease Out` / `Linear`), independent horizontal & vertical speeds, deadzone, and movement lead.
-- **Fast Mine**: configurable block break speed multiplier.
-- **Persistent Config**: automatically saves module states, keybinds, settings, and ClickGUI layout to `config/star.cfg`.
+- **Top-Bar Navigation ClickGUI** (`Right Shift` by default): switch cleanly between **`Modules`** (`Combat`, `Player`, `Movement`, `Render`), **`Settings`** (theme, font, layout, colors, keybind), and **`HUD`** directly from the top bar.
+- **Font & Theme Customization**: defaults to the sleek thin **`Smooth`** (`minecraft:uniform`) font at `0.90x` scale with options for `Smooth`, `Minecraft`, `Illager`, `Galactic`, font scale (`0.70x–1.20x`), text shadow, bold headers, italic values, 6 themes + custom RGBA pickers, and Rainbow Accent.
+- **Reusable Entity Selector Window**: pick exact Minecraft entity types (loaded dynamically from `minecraft:entity_type`) with live search, group quick-toggles (`Players`, `Hostile`, `Neutral`, `Passive`, `Misc`), and a 2-column checklist. Used by **Aim Assist**, **ESP**, **Tracers**, and **Nametags**.
+- **Combat**: **Aim Assist** with exact Entity Selector targeting, activation modes, range, FOV, priority, aim point, block raycast line-of-sight, per-frame/per-tick smoothing, deadzone, and movement lead.
+- **Render / Visuals**:
+  - **ESP**: 3D wireframe box, 3D filled + outline box (through walls), 2D box, 2D corner box, live health bars, and category/custom/distance colors.
+  - **Tracers**: 3D lines from your view to selected entities (`Feet`, `Center`, `Eyes`).
+  - **Nametags**: clean floating name + health + distance pills with optional vanilla tag hiding.
+  - **No Fog**: independently clear atmospheric, water, lava, and powder snow fog.
+  - **Zoom**: smooth camera magnification with reduced mouse sensitivity (`C` by default).
+  - **Camera**: disable camera/hurt shake and customize third-person camera distance.
+- **Player**: **Fast Mine** block break speed multiplier.
+- **HUD**: watermark, live `XYZ` coordinates, active modules ArrayList, target reticle, target info card, and FOV ring.
+- **Persistent Config**: automatically saves to `config/star.cfg`.
 
 ## Install into Horizon
 
@@ -20,7 +29,7 @@ A Meteor-inspired modular client mod for [Horizon](https://github.com/horizon-ru
    ```text
    https://github.com/Target9/Star
    ```
-4. Accept the native mod trust prompt, then click **Build** to compile Star for your Horizon build.
+4. Accept the native mod trust prompt, then click **Build**.
 
 ### From the CLI
 
@@ -29,8 +38,8 @@ horizon-launcher mods add-github https://github.com/Target9/Star --trust-native-
 horizon-launcher native-build
 ```
 
-## Controls
-
-- `Right Shift` — Open / close the ClickGUI (rebindable in Horizon Controls or inside `Client -> ClickGUI`).
-- **Left-click** a module to toggle it; **right-click** to expand its settings; **middle-click** (or click the **Bind** row) to set a keybind.
-- **Right-click** any setting row to reset it to its default value.
+To pull updates later:
+```sh
+horizon-launcher mods update-github star
+horizon-launcher native-build
+```

@@ -1,10 +1,13 @@
 //! Categories, module definitions, and the central `ModuleManager`.
 
-use crate::modules::{aim_assist, fast_mine};
+use crate::entity_filter::EntityFilter;
+use crate::font::FONT_PRESETS;
+use crate::modules::{aim_assist, fast_mine, visuals};
 use crate::settings::Setting;
 use crate::theme::THEME_PRESETS;
 
-/// Top-level categories shown as draggable windows in the ClickGUI.
+/// Top-level categories. `MODULE_PANELS` are shown as draggable columns in the
+/// `Modules` tab; `Client` modules (`ClickGUI` and `HUD`) live in the top bar tabs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Category {
     Combat,
@@ -21,6 +24,14 @@ impl Category {
         Category::Movement,
         Category::Render,
         Category::Client,
+    ];
+
+    /// Categories displayed as draggable panels on the main `Modules` tab.
+    pub const MODULE_PANELS: [Category; 4] = [
+        Category::Combat,
+        Category::Player,
+        Category::Movement,
+        Category::Render,
     ];
 
     pub fn index(self) -> usize {
@@ -59,7 +70,7 @@ impl Category {
             Category::Player => "P",
             Category::Movement => "M",
             Category::Render => "R",
-            Category::Client => "G",
+            Category::Client => "S",
         }
     }
 
@@ -73,11 +84,17 @@ impl Category {
 pub enum ModuleId {
     AimAssist,
     FastMine,
+    Esp,
+    Tracers,
+    Nametags,
+    NoFog,
+    Zoom,
+    Camera,
     Hud,
     ClickGui,
 }
 
-/// One toggleable feature/module displayed in its category window.
+/// One toggleable feature/module displayed in its category window or top tab.
 #[derive(Clone, Debug)]
 pub struct Module {
     pub id: ModuleId,
@@ -88,7 +105,7 @@ pub struct Module {
     pub enabled: bool,
     pub keybind: Option<String>,
     pub expanded: bool,
-    /// When false, the module is a configuration-only module (like ClickGUI) and does not show in the HUD ArrayList.
+    /// When false, the module is a configuration-only module (like ClickGUI/HUD) and does not show in the HUD ArrayList.
     pub show_in_arraylist: bool,
     pub settings: Vec<Setting>,
 }
@@ -132,6 +149,10 @@ impl Module {
         self.setting(id).and_then(Setting::as_keybind).flatten()
     }
 
+    pub fn entity_filter(&self, id: &str) -> Option<&EntityFilter> {
+        self.setting(id).and_then(Setting::as_entity_filter)
+    }
+
     /// Short live info tag rendered beside the module name in the HUD ArrayList (Meteor style).
     pub fn hud_tag(&self) -> Option<String> {
         match self.id {
@@ -144,7 +165,11 @@ impl Module {
                 let mult = self.float("multiplier", 1.4);
                 Some(format!("{mult:.2}x"))
             }
-            ModuleId::Hud | ModuleId::ClickGui => None,
+            ModuleId::Esp => Some(self.mode_str("style", "3D Fill + Box").to_owned()),
+            ModuleId::Tracers => Some(self.mode_str("target_point", "Center").to_owned()),
+            ModuleId::Nametags => Some(format!("{:.0}m", self.float("range", 64.0))),
+            ModuleId::Zoom => Some(format!("{:.1}x", self.float("factor", 4.0))),
+            ModuleId::NoFog | ModuleId::Camera | ModuleId::Hud | ModuleId::ClickGui => None,
         }
     }
 }
@@ -177,25 +202,33 @@ impl ModuleManager {
         let modules = vec![
             aim_assist::build_module(),
             fast_mine::build_module(),
+            visuals::build_esp_module(),
+            visuals::build_tracers_module(),
+            visuals::build_nametags_module(),
+            visuals::build_no_fog_module(),
+            visuals::build_zoom_module(),
+            visuals::build_camera_module(),
             build_hud_module(),
             build_click_gui_module(),
         ];
         Self {
             modules,
-            panels: default_panels(136.0),
+            panels: default_panels(154.0),
             config_loaded: false,
             dirty: false,
         }
     }
 
     pub fn reset_panel_layout(&mut self, screen_width: f32) {
-        let panel_w = self.get(ModuleId::ClickGui).int("panel_width", 136) as f32;
-        let gap = 10.0;
-        let total = Category::ALL.len() as f32 * panel_w + (Category::ALL.len() - 1) as f32 * gap;
+        let panel_w = self.get(ModuleId::ClickGui).int("panel_width", 154) as f32;
+        let gap = 12.0;
+        let count = Category::MODULE_PANELS.len();
+        let total = count as f32 * panel_w + (count - 1) as f32 * gap;
         let start_x = ((screen_width - total) * 0.5).max(12.0);
-        for (i, panel) in self.panels.iter_mut().enumerate() {
+        for (i, cat) in Category::MODULE_PANELS.into_iter().enumerate() {
+            let panel = &mut self.panels[cat.index()];
             panel.x = start_x + i as f32 * (panel_w + gap);
-            panel.y = 36.0;
+            panel.y = 38.0;
             panel.collapsed = false;
             panel.scroll = 0.0;
         }
@@ -206,6 +239,13 @@ impl ModuleManager {
         self.modules
             .iter()
             .find(|m| m.id == id)
+            .expect("registered module exists")
+    }
+
+    pub fn index_of(&self, id: ModuleId) -> usize {
+        self.modules
+            .iter()
+            .position(|m| m.id == id)
             .expect("registered module exists")
     }
 
@@ -282,11 +322,11 @@ impl ModuleManager {
 }
 
 fn default_panels(panel_width: f32) -> [PanelState; 5] {
-    let gap = 10.0;
-    let start_x = 14.0;
+    let gap = 12.0;
+    let start_x = 18.0;
     let mut out = [PanelState {
         x: start_x,
-        y: 36.0,
+        y: 38.0,
         collapsed: false,
         scroll: 0.0,
     }; 5];
@@ -300,12 +340,12 @@ fn build_click_gui_module() -> Module {
     Module {
         id: ModuleId::ClickGui,
         key: "click_gui",
-        name: "ClickGUI",
-        description: "Customize the module menu theme, colors, layout, blur, and keybind.",
+        name: "Client Settings",
+        description: "Customize Star's theme, font, typography, colors, layout, blur, and keybind.",
         category: Category::Client,
         enabled: true,
         keybind: None,
-        expanded: false,
+        expanded: true,
         show_in_arraylist: false,
         settings: vec![
             Setting::keybind(
@@ -315,6 +355,42 @@ fn build_click_gui_module() -> Module {
                 Some("key.keyboard.right.shift"),
             )
             .group("Controls"),
+            Setting::mode(
+                "font_face",
+                "Font",
+                "Font style used across Star's ClickGUI, modals, HUD, and Nametags.",
+                FONT_PRESETS,
+                0,
+            )
+            .group("Font & Typography"),
+            Setting::float(
+                "font_scale",
+                "Font Scale",
+                "Global text size multiplier for crisp, uncluttered readability.",
+                0.70,
+                1.20,
+                0.05,
+                0.90,
+            )
+            .suffix("x"),
+            Setting::bool(
+                "font_shadow",
+                "Text Shadow",
+                "Render drop shadows behind UI and HUD text.",
+                false,
+            ),
+            Setting::bool(
+                "bold_headers",
+                "Bold Headers",
+                "Use bold weight on panel titles, tabs, and section headers.",
+                true,
+            ),
+            Setting::bool(
+                "italic_values",
+                "Italic Values",
+                "Use italic style for numeric and mode values.",
+                false,
+            ),
             Setting::mode(
                 "preset",
                 "Theme",
@@ -357,10 +433,10 @@ fn build_click_gui_module() -> Module {
                 "panel_width",
                 "Panel Width",
                 "Width of each category window in GUI pixels.",
-                110,
-                210,
+                124,
+                220,
                 4,
-                136,
+                154,
             )
             .suffix("px")
             .group("Layout"),
@@ -368,10 +444,10 @@ fn build_click_gui_module() -> Module {
                 "row_height",
                 "Row Height",
                 "Height of each module row in GUI pixels.",
-                13,
+                14,
                 22,
                 1,
-                16,
+                17,
             )
             .suffix("px"),
             Setting::bool(
@@ -420,11 +496,11 @@ fn build_hud_module() -> Module {
         id: ModuleId::Hud,
         key: "hud",
         name: "HUD",
-        description: "In-game watermark, active module ArrayList, and Aim Assist overlays.",
+        description: "In-game watermark, coordinates, active module ArrayList, and Aim Assist overlays.",
         category: Category::Client,
         enabled: true,
         keybind: None,
-        expanded: false,
+        expanded: true,
         show_in_arraylist: false,
         settings: vec![
             Setting::bool(
@@ -434,6 +510,12 @@ fn build_hud_module() -> Module {
                 true,
             )
             .group("Elements"),
+            Setting::bool(
+                "coords",
+                "Coordinates",
+                "Display live X / Y / Z coordinates in the bottom-left corner.",
+                true,
+            ),
             Setting::bool(
                 "arraylist",
                 "Active Modules",

@@ -1,9 +1,11 @@
 //! Star — Meteor-inspired modular client for Horizon (Minecraft 26.3 in Rust).
 //!
-//! Press Right Shift (customizable in Controls or the ClickGUI) while in a world
-//! to open the categorized module GUI.
+//! Press Right Shift (customizable in Controls or the Settings tab) while in a world
+//! to open the ClickGUI.
 
 mod config;
+mod entity_filter;
+mod font;
 mod gui;
 mod hud;
 mod module;
@@ -14,17 +16,19 @@ mod theme;
 use std::sync::{Mutex, OnceLock};
 
 use mod_api::{
-    self, ClientHost, ClientTickPreEvent, Flow, HostSide, InputKeyEvent, KeyAction,
-    KeyConflictContext, KeyRegistration, PlayerBreakSpeedEvent, Registrar, RegistrationContext,
-    RenderFramePreEvent, RenderGuiPostEvent, ScreenCharTypedPreEvent, ScreenClosingEvent,
-    ScreenKeyPressedPreEvent, ScreenMouseButtonPressedPreEvent, ScreenMouseButtonReleasedPreEvent,
+    self, CameraDistanceEvent, CameraShakeEvent, ClientHost, ClientTickPreEvent, Flow, HostSide,
+    InputKeyEvent, KeyAction, KeyConflictContext, KeyRegistration, PlayerBreakSpeedEvent,
+    Registrar, RegistrationContext, RenderFogEvent, RenderFramePreEvent, RenderGuiPostEvent,
+    RenderNameTagEvent, ScreenCharTypedPreEvent, ScreenClosingEvent, ScreenKeyPressedPreEvent,
+    ScreenMouseButtonPressedPreEvent, ScreenMouseButtonReleasedPreEvent,
     ScreenMouseDraggedPreEvent, ScreenMouseScrolledPreEvent, ScreenRenderPostEvent, SettingSpec,
+    SubmitCustomGeometryEvent, Zoom, ZoomEvent,
 };
 
 use crate::gui::ClickGuiState;
 use crate::module::{ModuleId, ModuleManager};
 use crate::modules::aim_assist::{self, AimTargetInfo};
-use crate::modules::fast_mine;
+use crate::modules::{fast_mine, visuals};
 
 const MOD_ID: &str = "star";
 const OPEN_GUI_KEY_ID: &str = "open_gui";
@@ -66,7 +70,11 @@ struct Mod;
 
 #[mod_api::horizon_mod]
 impl mod_api::Hooks for Mod {
-    fn register(&self, registrar: &mut dyn Registrar, _: &RegistrationContext) {
+    fn register(&self, registrar: &mut dyn Registrar, ctx: &RegistrationContext) {
+        if let Ok(entity_types) = ctx.registry("minecraft:entity_type") {
+            entity_filter::init_catalog(&entity_types);
+        }
+
         let _ = registrar.register_setting(
             SettingSpec::toggle("enabled", "star.setting.enabled", true)
                 .tooltip("star.setting.enabled.tip"),
@@ -84,8 +92,6 @@ impl mod_api::Hooks for Mod {
             return;
         }
 
-        // Resolve the active ClickGUI toggle key: prefer the ClickGUI module setting,
-        // or the key bound in Horizon's Options > Controls.
         let controls_key = host.mod_key(MOD_ID, OPEN_GUI_KEY_ID).map(|(k, _)| k);
 
         enum Action {
@@ -102,7 +108,6 @@ impl mod_api::Hooks for Mod {
 
             let own_screen = host.mod_screen() == Some(MOD_ID);
             if own_screen && st.gui.is_listening() {
-                // Keybind capture is handled by screen_key_pressed_pre.
                 Action::None
             } else {
                 let configured_key = st
@@ -183,6 +188,58 @@ impl mod_api::Hooks for Mod {
             let target = aim_assist::step(host, &aim_module, tick_scale, true);
             lock_state().aim_target = target;
         }
+    }
+
+    fn submit_custom_geometry(
+        &self,
+        host: &dyn ClientHost,
+        event: &mut SubmitCustomGeometryEvent<'_>,
+    ) {
+        if !mod_active(host) {
+            return;
+        }
+        let st = lock_state();
+        visuals::render_world_geometry(host, event.view, event.draw, &st.manager);
+    }
+
+    fn render_fog(&self, host: &dyn ClientHost, event: &mut RenderFogEvent<'_>) {
+        if !mod_active(host) {
+            return;
+        }
+        let no_fog = lock_state().manager.get(ModuleId::NoFog).clone();
+        visuals::apply_no_fog(&no_fog, event);
+    }
+
+    fn zoom(&self, host: &dyn ClientHost, _: &mut ZoomEvent) -> Option<Zoom> {
+        if !mod_active(host) {
+            return None;
+        }
+        let zoom_mod = lock_state().manager.get(ModuleId::Zoom).clone();
+        visuals::apply_zoom(&zoom_mod)
+    }
+
+    fn camera_shake(&self, host: &dyn ClientHost, event: &mut CameraShakeEvent<'_>) {
+        if !mod_active(host) {
+            return;
+        }
+        let cam = lock_state().manager.get(ModuleId::Camera).clone();
+        visuals::apply_camera_shake(&cam, event);
+    }
+
+    fn camera_distance(&self, host: &dyn ClientHost, event: &mut CameraDistanceEvent<'_>) {
+        if !mod_active(host) {
+            return;
+        }
+        let cam = lock_state().manager.get(ModuleId::Camera).clone();
+        visuals::apply_camera_distance(&cam, event);
+    }
+
+    fn render_name_tag(&self, host: &dyn ClientHost, event: &mut RenderNameTagEvent<'_>) {
+        if !mod_active(host) {
+            return;
+        }
+        let nt = lock_state().manager.get(ModuleId::Nametags).clone();
+        visuals::apply_nametag_hide(&nt, event);
     }
 
     fn player_break_speed(

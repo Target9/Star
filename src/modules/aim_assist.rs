@@ -7,6 +7,7 @@
 
 use mod_api::{ClientHost, ClipBlock, ClipFluid, EntityRef, Hand};
 
+use crate::entity_filter::{EntityFilter, pretty_entity_id};
 use crate::module::{Category, Module, ModuleId};
 use crate::settings::Setting;
 
@@ -34,19 +35,13 @@ pub fn build_module() -> Module {
         expanded: false,
         show_in_arraylist: true,
         settings: vec![
-            Setting::bool(
-                "players",
-                "Players",
-                "Target other players in range.",
-                true,
+            Setting::entity_filter(
+                "entities",
+                "Targets",
+                "Open the Entity Selector to pick the exact entity types Aim Assist tracks.",
+                EntityFilter::players_only(),
             )
             .group("Targets"),
-            Setting::bool(
-                "mobs",
-                "Mobs",
-                "Target living non-player mobs in range.",
-                false,
-            ),
             Setting::bool(
                 "ignore_invisible",
                 "Ignore Invisible",
@@ -197,8 +192,7 @@ pub fn step(
         return None;
     }
 
-    let players = module.bool("players", true);
-    let mobs = module.bool("mobs", false);
+    let entities = module.entity_filter("entities")?;
     let ignore_invisible = module.bool("ignore_invisible", true);
     let range = module.float("range", 4.5);
     let fov = module.int("fov", 90) as f32;
@@ -211,8 +205,7 @@ pub fn step(
         host,
         player,
         TargetFilter {
-            players,
-            mobs,
+            entities,
             ignore_invisible,
             range,
             fov,
@@ -270,9 +263,8 @@ pub fn step(
     })
 }
 
-struct TargetFilter {
-    players: bool,
-    mobs: bool,
+struct TargetFilter<'a> {
+    entities: &'a EntityFilter,
     ignore_invisible: bool,
     range: f64,
     fov: f32,
@@ -319,9 +311,9 @@ fn is_holding_weapon(host: &dyn ClientHost, player: EntityRef) -> bool {
 fn pick_target(
     host: &dyn ClientHost,
     player: EntityRef,
-    filter: TargetFilter,
+    filter: TargetFilter<'_>,
 ) -> Option<(EntityRef, [f64; 3], f64, f32)> {
-    if !filter.players && !filter.mobs {
+    if filter.entities.is_empty() {
         return None;
     }
 
@@ -345,20 +337,14 @@ fn pick_target(
             continue;
         }
 
-        let is_player_entity = entity
-            .kind(host)
-            .is_some_and(|k| k.id(host) == "minecraft:player");
-        if is_player_entity && !filter.players {
+        let Some(kind) = entity.kind(host) else {
             continue;
-        }
-        if !is_player_entity && !filter.mobs {
+        };
+        let kind_id = kind.id(host);
+        if !filter.entities.contains(&kind_id) {
             continue;
         }
 
-        // Skip non-living entities (items, arrows, displays, etc.).
-        if !is_player_entity && !is_likely_living(host, entity) {
-            continue;
-        }
         if let Some(living) = host.living(entity)
             && (living.alive(host) == Some(false)
                 || living.health(host).is_some_and(|h| h <= 0.0))
@@ -416,55 +402,6 @@ fn pick_target(
     }
 
     best.map(|(_, e, p, d, a)| (e, p, d, a))
-}
-
-fn is_likely_living(host: &dyn ClientHost, entity: EntityRef) -> bool {
-    if host.living(entity).is_some() {
-        return true;
-    }
-    let Some(kind) = entity.kind(host) else {
-        return false;
-    };
-    let id = kind.id(host);
-    let path = id.split_once(':').map_or(id.as_str(), |(_, p)| p);
-    !matches!(
-        path,
-        "item"
-            | "experience_orb"
-            | "arrow"
-            | "spectral_arrow"
-            | "trident"
-            | "snowball"
-            | "egg"
-            | "ender_pearl"
-            | "potion"
-            | "splash_potion"
-            | "lingering_potion"
-            | "experience_bottle"
-            | "firework_rocket"
-            | "falling_block"
-            | "tnt"
-            | "painting"
-            | "item_frame"
-            | "glow_item_frame"
-            | "leash_knot"
-            | "area_effect_cloud"
-            | "marker"
-            | "interaction"
-            | "block_display"
-            | "item_display"
-            | "text_display"
-            | "armor_stand"
-            | "boat"
-            | "chest_boat"
-            | "minecart"
-            | "chest_minecart"
-            | "hopper_minecart"
-            | "tnt_minecart"
-            | "furnace_minecart"
-            | "fishing_bobber"
-            | "lightning_bolt"
-    )
 }
 
 fn select_aim_point(
@@ -584,20 +521,6 @@ pub fn dist(a: [f64; 3], b: [f64; 3]) -> f64 {
     let dy = a[1] - b[1];
     let dz = a[2] - b[2];
     (dx * dx + dy * dy + dz * dz).sqrt()
-}
-
-fn pretty_entity_id(id: &str) -> String {
-    let path = id.split_once(':').map_or(id, |(_, p)| p);
-    path.split('_')
-        .map(|w| {
-            let mut chars = w.chars();
-            match chars.next() {
-                Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.as_str()),
-                None => String::new(),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 #[cfg(test)]

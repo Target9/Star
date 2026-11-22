@@ -1,5 +1,7 @@
 //! Typed settings primitives shared by every module and rendered by the ClickGUI.
 
+use crate::entity_filter::EntityFilter;
+
 /// The interactive value and bounds of a module setting.
 #[derive(Clone, Debug)]
 pub enum SettingKind {
@@ -39,6 +41,11 @@ pub enum SettingKind {
     Keybind {
         key: Option<String>,
         default: Option<&'static str>,
+    },
+    /// Exact set of selected entity type IDs edited via the Entity Selector modal window.
+    EntityFilter {
+        value: EntityFilter,
+        default: EntityFilter,
     },
 }
 
@@ -185,6 +192,24 @@ impl Setting {
         }
     }
 
+    pub fn entity_filter(
+        id: &'static str,
+        name: &'static str,
+        description: &'static str,
+        default: EntityFilter,
+    ) -> Self {
+        Self {
+            id,
+            name,
+            description,
+            group: None,
+            kind: SettingKind::EntityFilter {
+                value: default.clone(),
+                default,
+            },
+        }
+    }
+
     pub fn group(mut self, group: &'static str) -> Self {
         self.group = Some(group);
         self
@@ -239,6 +264,20 @@ impl Setting {
         }
     }
 
+    pub fn as_entity_filter(&self) -> Option<&EntityFilter> {
+        match &self.kind {
+            SettingKind::EntityFilter { value, .. } => Some(value),
+            _ => None,
+        }
+    }
+
+    pub fn as_entity_filter_mut(&mut self) -> Option<&mut EntityFilter> {
+        match &mut self.kind {
+            SettingKind::EntityFilter { value, .. } => Some(value),
+            _ => None,
+        }
+    }
+
     /// Resets this setting back to its default value. Returns true if it changed.
     pub fn reset(&mut self) -> bool {
         match &mut self.kind {
@@ -271,6 +310,11 @@ impl Setting {
                 let target = default.map(str::to_owned);
                 let changed = *key != target;
                 *key = target;
+                changed
+            }
+            SettingKind::EntityFilter { value, default } => {
+                let changed = *value != *default;
+                *value = default.clone();
                 changed
             }
         }
@@ -383,6 +427,7 @@ impl Setting {
             }
             SettingKind::Color { value, .. } => format!("#{:08X}", value),
             SettingKind::Keybind { key, .. } => format_key_name(key.as_deref()),
+            SettingKind::EntityFilter { value, .. } => value.summary(),
         }
     }
 
@@ -399,6 +444,7 @@ impl Setting {
             }
             SettingKind::Color { value, .. } => format!("{value:08X}"),
             SettingKind::Keybind { key, .. } => key.clone().unwrap_or_default(),
+            SettingKind::EntityFilter { value, .. } => value.serialize(),
         }
     }
 
@@ -463,6 +509,9 @@ impl Setting {
                 } else {
                     *key = Some(raw.to_owned());
                 }
+            }
+            SettingKind::EntityFilter { value, .. } => {
+                *value = EntityFilter::deserialize(raw);
             }
         }
     }

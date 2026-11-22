@@ -1,145 +1,190 @@
-//! Meteor-inspired ClickGUI rendered on Horizon's mod screen (`host.mod_screen_open`).
+//! Meteor-inspired ClickGUI rendered on Horizon's mod screen (`host.mod_screen_open("star")`).
 //!
-//! Layout features:
-//! - Top bar with live search box, Reset Layout button, and quick controls legend
-//! - Draggable, collapsible, scrollable Category windows (Combat, Player, Movement, Render, Client)
-//! - Left-click module to toggle, Right-click to expand settings, Middle-click to bind hotkey
-//! - Draggable Float/Int sliders (with scroll-wheel fine adjustment and Right-click reset)
-//! - Expandable RGBA Color pickers, Mode cyclers, Keybind listeners, and Hover Tooltips
+//! Features:
+//! - Top navigation tabs: `Modules` | `Settings` | `HUD`
+//! - Draggable, collapsible, scrollable category panels on the `Modules` tab
+//! - Dedicated centered settings cards for Client Settings (Theme, Font, Layout, Colors) & HUD
+//! - Reusable floating Entity Selector modal window for exact entity-type filtering
+//! - Live search bar (clears placeholder text immediately while focused/typing)
+//! - Inline setting drawers, RGBA color pickers, keybind capture, and hover tooltips
 
 use mod_api::{ClientHost, DrawContext};
 
+use crate::entity_filter::{self, EntityGroup};
+use crate::font::FontConfig;
 use crate::module::{Category, ModuleId, ModuleManager};
 use crate::settings::{SettingKind, format_key_name};
-use crate::theme::{Theme, argb_parts, blend_rgb, lighten, pack_argb, with_alpha};
+use crate::theme::{Theme, with_alpha};
 
 const TOP_BAR_H: f32 = 24.0;
-const COLOR_DRAWER_H: f32 = 52.0;
+const HEADER_H: f32 = 19.0;
+const FOOTER_H: f32 = 16.0;
+const SETTING_H: f32 = 16.0;
+const GROUP_H: f32 = 14.0;
+const COLOR_CHANNEL_H: f32 = 13.0;
+const COLOR_DRAWER_H: f32 = COLOR_CHANNEL_H * 4.0 + 4.0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuiTab {
+    Modules,
+    Settings,
+    Hud,
+}
+
+impl GuiTab {
+    const ALL: [GuiTab; 3] = [GuiTab::Modules, GuiTab::Settings, GuiTab::Hud];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Modules => "Modules",
+            Self::Settings => "Settings",
+            Self::Hud => "HUD",
+        }
+    }
+}
+
+/// Interactive state for the floating Entity Selector modal window.
+#[derive(Clone, Debug)]
+struct EntityPickerState {
+    mod_idx: usize,
+    set_idx: usize,
+    search: String,
+    search_focused: bool,
+    scroll: f32,
+    /// `None` = All, `Some(None)` = Selected only, `Some(Some(g))` = Group filter
+    filter: PickerFilter,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PickerFilter {
+    All,
+    Selected,
+    Group(EntityGroup),
+}
+
+/// Persistent interactive state for the ClickGUI while the mod screen is open.
+#[derive(Debug)]
+pub struct ClickGuiState {
+    pub active_tab: GuiTab,
+    pub search: String,
+    pub search_focused: bool,
+    layout_initialized: bool,
+    screen_size: [f32; 2],
+    panel_order: Vec<Category>,
+    dragging: Option<DragTarget>,
+    listening_bind: Option<BindTarget>,
+    entity_picker: Option<EntityPickerState>,
+    settings_scroll: f32,
+    hud_scroll: f32,
+    hits: Vec<HitRegion>,
+    panel_rects: Vec<(Category, [f32; 4], f32)>,
+    card_scroll_rect: Option<([f32; 4], f32)>,
+    picker_list_rect: Option<([f32; 4], f32)>,
+    picker_window_rect: Option<[f32; 4]>,
+    hovered_tooltip: Option<String>,
+}
+
+impl Default for ClickGuiState {
+    fn default() -> Self {
+        Self {
+            active_tab: GuiTab::Modules,
+            search: String::new(),
+            search_focused: false,
+            layout_initialized: false,
+            screen_size: [640.0, 360.0],
+            panel_order: Category::MODULE_PANELS.to_vec(),
+            dragging: None,
+            listening_bind: None,
+            entity_picker: None,
+            settings_scroll: 0.0,
+            hud_scroll: 0.0,
+            hits: Vec::new(),
+            panel_rects: Vec::new(),
+            card_scroll_rect: None,
+            picker_list_rect: None,
+            picker_window_rect: None,
+            hovered_tooltip: None,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
-enum ActiveDrag {
+enum DragTarget {
     Panel {
-        cat: Category,
+        category: Category,
         offset_x: f32,
         offset_y: f32,
     },
     Slider {
         mod_idx: usize,
         set_idx: usize,
-        track_x: f32,
-        track_w: f32,
+        x: f32,
+        w: f32,
     },
     ColorChannel {
         mod_idx: usize,
         set_idx: usize,
-        channel: u8, // 0=R, 1=G, 2=B, 3=A
-        track_x: f32,
-        track_w: f32,
+        channel: u8,
+        x: f32,
+        w: f32,
     },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum KeybindTarget {
+enum BindTarget {
     Module(usize),
     Setting { mod_idx: usize, set_idx: usize },
 }
 
 #[derive(Clone, Debug)]
-enum HitAction {
-    SearchBox,
-    ClearSearch,
-    ResetLayout,
-    PanelHeader(Category),
-    PanelBody(Category),
-    ModuleRow(usize),
-    SettingBool { mod_idx: usize, set_idx: usize },
-    SettingSlider {
-        mod_idx: usize,
-        set_idx: usize,
-        track_x: f32,
-        track_w: f32,
-    },
-    SettingMode { mod_idx: usize, set_idx: usize },
-    SettingKeybind { mod_idx: usize, set_idx: usize },
-    SettingColorHeader { mod_idx: usize, set_idx: usize },
-    SettingColorChannel {
-        mod_idx: usize,
-        set_idx: usize,
-        channel: u8,
-        track_x: f32,
-        track_w: f32,
-    },
+struct HitRegion {
+    rect: [f32; 4],
+    kind: HitKind,
+    tooltip: Option<String>,
 }
 
 #[derive(Clone, Debug)]
-struct HitItem {
-    rect: [f32; 4],
-    clip: Option<[f32; 4]>,
-    action: HitAction,
-    tooltip: Option<&'static str>,
-}
-
-impl HitItem {
-    fn contains(&self, pt: [f32; 2]) -> bool {
-        if let Some(c) = self.clip
-            && !rect_contains(c, pt)
-        {
-            return false;
-        }
-        rect_contains(self.rect, pt)
-    }
-}
-
-/// Interactive runtime state for the ClickGUI screen.
-pub struct ClickGuiState {
-    pub panel_order: [Category; 5],
-    pub search: String,
-    pub search_focused: bool,
-    drag: Option<ActiveDrag>,
-    listening: Option<KeybindTarget>,
-    hits: Vec<HitItem>,
-    last_screen_size: [f32; 2],
-    laid_out_once: bool,
-}
-
-impl Default for ClickGuiState {
-    fn default() -> Self {
-        Self {
-            panel_order: Category::ALL,
-            search: String::new(),
-            search_focused: false,
-            drag: None,
-            listening: None,
-            hits: Vec::with_capacity(128),
-            last_screen_size: [640.0, 360.0],
-            laid_out_once: false,
-        }
-    }
+enum HitKind {
+    Tab(GuiTab),
+    SearchBar,
+    SearchClear,
+    ResetLayout,
+    PanelHeader(Category),
+    PanelCollapse(Category),
+    ModuleRow(usize),
+    ModuleBind(usize),
+    ToggleModuleEnabled(usize),
+    SettingBool { mod_idx: usize, set_idx: usize },
+    SettingSlider { mod_idx: usize, set_idx: usize },
+    SettingMode { mod_idx: usize, set_idx: usize },
+    SettingColorHeader { mod_idx: usize, set_idx: usize },
+    SettingColorChannel { mod_idx: usize, set_idx: usize, channel: u8 },
+    SettingKeybind { mod_idx: usize, set_idx: usize },
+    SettingEntityFilter { mod_idx: usize, set_idx: usize },
+    // Entity picker modal hits
+    PickerClose,
+    PickerSearchBar,
+    PickerSearchClear,
+    PickerSelectAll,
+    PickerSelectNone,
+    PickerToggleGroup(EntityGroup),
+    PickerFilterTab(PickerFilter),
+    PickerEntityToggle(String),
 }
 
 impl ClickGuiState {
-    pub fn on_close(&mut self) {
-        self.drag = None;
-        self.listening = None;
-        self.search_focused = false;
-    }
-
     pub fn is_listening(&self) -> bool {
-        self.listening.is_some()
+        self.listening_bind.is_some()
     }
 
-    fn bring_to_front(&mut self, cat: Category) {
-        if let Some(pos) = self.panel_order.iter().position(|c| *c == cat) {
-            let item = self.panel_order[pos];
-            for i in pos..self.panel_order.len() - 1 {
-                self.panel_order[i] = self.panel_order[i + 1];
-            }
-            let last = self.panel_order.len() - 1;
-            self.panel_order[last] = item;
-        }
+    pub fn on_close(&mut self) {
+        self.dragging = None;
+        self.listening_bind = None;
+        self.search_focused = false;
+        self.entity_picker = None;
     }
 
-    /// Renders the entire ClickGUI and refreshes hit-test regions for this frame.
+    /// Renders the entire ClickGUI and rebuilds interactive hit regions for the frame.
     pub fn render(
         &mut self,
         host: &dyn ClientHost,
@@ -148,689 +193,1520 @@ impl ClickGuiState {
         manager: &mut ModuleManager,
     ) {
         let size = draw.size();
-        self.last_screen_size = size;
-        let theme = Theme::from_manager(manager, host.millis());
+        self.screen_size = size;
 
-        if !self.laid_out_once && !manager.config_loaded {
-            manager.reset_panel_layout(size[0]);
-            manager.dirty = false;
+        if !self.layout_initialized {
+            let needs_default = Category::MODULE_PANELS
+                .iter()
+                .all(|c| (manager.panels[c.index()].y - 38.0).abs() < 0.5);
+            if needs_default {
+                manager.reset_panel_layout(size[0]);
+                manager.dirty = false;
+            }
+            self.layout_initialized = true;
         }
-        self.laid_out_once = true;
 
-        if theme.blur_background {
+        let theme = Theme::from_manager(manager, host.millis());
+        let font = FontConfig::from_manager(manager);
+        let gui_mod = manager.get(ModuleId::ClickGui);
+        let use_blur = gui_mod.bool("blur", true);
+        let backdrop_dim = gui_mod.float("backdrop_dim", 0.45) as f32;
+        let show_tooltips = gui_mod.bool("descriptions", true);
+
+        if use_blur {
             let _ = host.apply_screen_blur();
         }
-        if (theme.backdrop_dim >> 24) > 0 {
-            draw.fill([0.0, 0.0, size[0], size[1]], theme.backdrop_dim);
+        if backdrop_dim > 0.005 {
+            let alpha = (backdrop_dim.clamp(0.0, 0.92) * 255.0).round() as u32;
+            draw.fill([0.0, 0.0, size[0], size[1]], alpha << 24);
         }
 
         self.hits.clear();
+        self.panel_rects.clear();
+        self.card_scroll_rect = None;
+        self.picker_list_rect = None;
+        self.picker_window_rect = None;
+        self.hovered_tooltip = None;
 
-        // Draw panels back-to-front so frontmost panel draws on top.
-        let order = self.panel_order;
-        for cat in order {
-            self.draw_category_panel(draw, size, mouse, manager, &theme, cat);
+        // When the Entity Picker modal is open, ignore hover on background elements.
+        let bg_mouse = if self.entity_picker.is_some() {
+            [-9999.0, -9999.0]
+        } else {
+            mouse
+        };
+
+        self.render_top_bar(draw, size, bg_mouse, &theme, font);
+
+        match self.active_tab {
+            GuiTab::Modules => {
+                let order = self.panel_order.clone();
+                for category in order {
+                    self.render_panel(draw, category, size, bg_mouse, manager, &theme, font);
+                }
+            }
+            GuiTab::Settings => {
+                let idx = manager.index_of(ModuleId::ClickGui);
+                self.render_settings_card(
+                    draw,
+                    idx,
+                    "Client Settings",
+                    "Customize Star's font, theme, colors, layout, and controls.",
+                    false,
+                    size,
+                    bg_mouse,
+                    manager,
+                    &theme,
+                    font,
+                );
+            }
+            GuiTab::Hud => {
+                let idx = manager.index_of(ModuleId::Hud);
+                self.render_settings_card(
+                    draw,
+                    idx,
+                    "HUD Overlay",
+                    "Configure watermark, coordinates, active module list, and opacity.",
+                    true,
+                    size,
+                    bg_mouse,
+                    manager,
+                    &theme,
+                    font,
+                );
+            }
         }
 
-        // Top bar drawn above panels so search and Reset Layout are always reachable.
-        self.draw_top_bar(draw, size, mouse, &theme);
+        self.render_footer(draw, size, &theme, font);
 
-        // Hover tooltip drawn last so it sits above everything.
-        if theme.show_descriptions
-            && self.drag.is_none()
-            && let Some(tip) = self.hovered_tooltip(mouse)
-        {
-            draw_tooltip(draw, size, mouse, tip, &theme);
+        if self.entity_picker.is_some() {
+            // Clear background hits so modal captures all interactions cleanly.
+            self.hits.clear();
+            self.render_entity_picker(draw, size, mouse, manager, &theme, font);
+        } else if show_tooltips {
+            let tip = self.hovered_tooltip.clone().or_else(|| {
+                self.hits
+                    .iter()
+                    .rev()
+                    .find(|h| rect_contains(h.rect, mouse))
+                    .and_then(|h| h.tooltip.clone())
+            });
+            if let Some(tip) = tip {
+                self.render_tooltip(draw, size, mouse, &tip, &theme, font);
+            }
         }
     }
 
-    fn draw_top_bar(
+    fn render_top_bar(
         &mut self,
         draw: &mut dyn DrawContext,
         size: [f32; 2],
         mouse: [f32; 2],
         theme: &Theme,
+        font: FontConfig,
     ) {
         let w = size[0];
         draw.fill_gradient(
             [0.0, 0.0, w, TOP_BAR_H],
             theme.header_bg,
-            with_alpha(theme.panel_bg, 0xE8),
+            with_alpha(theme.panel_bg, 0xEC),
         );
-        draw.fill([0.0, TOP_BAR_H - 1.5, w, 1.5], theme.accent);
+        draw.fill([0.0, TOP_BAR_H - 1.2, w, 1.2], with_alpha(theme.accent, 0xCC));
 
         // Brand title on left
         let title = "STAR";
-        draw.text(title, [10.0, 7.5], theme.accent, true);
-        let title_w = draw.text_width(title);
-        draw.text("v0.1", [14.0 + title_w, 7.5], theme.text_muted, false);
+        let ver = "v0.2";
+        let ty = font.center_y(0.0, TOP_BAR_H - 1.0);
+        font.draw_header(draw, title, [10.0, ty], theme.accent);
+        let title_w = font.width(draw, title, font.bold_headers);
+        font.draw_body(draw, ver, [14.0 + title_w, ty], theme.text_muted);
 
-        // Centered search box
-        let search_w = (w * 0.28).clamp(110.0, 220.0);
-        let search_h = 15.0;
-        let search_x = (w - search_w) * 0.5;
-        let search_y = (TOP_BAR_H - search_h) * 0.5 - 0.5;
-        let search_rect = [search_x, search_y, search_w, search_h];
-        let search_hover = rect_contains(search_rect, mouse);
+        // Top navigation tabs directly in the top bar: Modules | Settings | HUD
+        let mut tab_x = 14.0 + title_w + font.width(draw, ver, false) + 14.0;
+        let tab_h = TOP_BAR_H - 5.0;
+        let tab_y = 2.5;
+        for tab in GuiTab::ALL {
+            let label = tab.label();
+            let active = self.active_tab == tab;
+            let lw = font.width(draw, label, active && font.bold_headers);
+            let tab_w = (lw + 14.0).max(46.0);
+            let rect = [tab_x, tab_y, tab_w, tab_h];
+            let hover = rect_contains(rect, mouse);
 
-        let box_bg = if self.search_focused || search_hover {
-            theme.module_hover
-        } else {
-            theme.setting_bg
-        };
-        let box_border = if self.search_focused {
-            theme.accent
-        } else {
-            theme.border
-        };
-        draw_bordered_rect(draw, search_rect, box_bg, box_border);
+            if active {
+                draw.fill(rect, with_alpha(theme.accent, 0x36));
+                draw.fill([tab_x, TOP_BAR_H - 2.0, tab_w, 2.0], theme.accent);
+            } else if hover {
+                draw.fill(rect, with_alpha(theme.module_hover, 0xCC));
+            }
 
-        if self.search.is_empty() {
-            draw.text(
-                "Search modules...",
-                [search_x + 5.0, search_y + 3.5],
-                theme.text_muted,
-                false,
-            );
-        } else {
-            let caret = if self.search_focused { "_" } else { "" };
-            let shown = format!("{}{caret}", self.search);
-            let _ = draw.push_clip([search_x + 3.0, search_y, search_w - 18.0, search_h]);
-            draw.text(&shown, [search_x + 5.0, search_y + 3.5], theme.text, false);
-            let _ = draw.pop_clip();
-
-            let clear_rect = [search_x + search_w - 14.0, search_y + 1.0, 13.0, search_h - 2.0];
-            let clear_col = if rect_contains(clear_rect, mouse) {
-                theme.accent
+            let text_x = tab_x + (tab_w - lw) * 0.5;
+            let text_y = font.center_y(tab_y, tab_h);
+            if active {
+                font.draw_header(draw, label, [text_x, text_y], theme.text);
             } else {
-                theme.text_muted
-            };
-            draw.text("x", [clear_rect[0] + 4.0, search_y + 3.0], clear_col, false);
-            self.hits.push(HitItem {
-                rect: clear_rect,
-                clip: None,
-                action: HitAction::ClearSearch,
-                tooltip: Some("Clear search filter."),
+                font.draw_body(
+                    draw,
+                    label,
+                    [text_x, text_y],
+                    if hover { theme.text } else { theme.text_muted },
+                );
+            }
+
+            self.hits.push(HitRegion {
+                rect,
+                kind: HitKind::Tab(tab),
+                tooltip: None,
             });
+            tab_x += tab_w + 4.0;
         }
 
-        self.hits.push(HitItem {
-            rect: [
-                search_x,
-                search_y,
-                if self.search.is_empty() {
-                    search_w
+        // Modules tab controls on right: Search box + Reset Layout
+        if self.active_tab == GuiTab::Modules {
+            let reset_label = "Reset Layout";
+            let reset_w = font.width(draw, reset_label, false) + 12.0;
+            let reset_h = 15.0;
+            let reset_x = w - reset_w - 8.0;
+            let reset_y = (TOP_BAR_H - reset_h) * 0.5 - 0.5;
+            let reset_rect = [reset_x, reset_y, reset_w, reset_h];
+            let reset_hover = rect_contains(reset_rect, mouse);
+            draw.fill(
+                reset_rect,
+                if reset_hover {
+                    theme.module_hover
                 } else {
-                    search_w - 15.0
+                    theme.setting_bg
                 },
-                search_h,
-            ],
-            clip: None,
-            action: HitAction::SearchBox,
-            tooltip: Some("Type to filter modules or settings across all categories."),
-        });
+            );
+            draw_outline(draw, reset_rect, theme.border);
+            font.draw_body(
+                draw,
+                reset_label,
+                [reset_x + 6.0, font.center_y(reset_y, reset_h)],
+                if reset_hover {
+                    theme.text
+                } else {
+                    theme.text_muted
+                },
+            );
+            self.hits.push(HitRegion {
+                rect: reset_rect,
+                kind: HitKind::ResetLayout,
+                tooltip: Some("Reset all category panels to their default positions.".into()),
+            });
 
-        // Reset Layout button on right
-        let btn_label = "Reset Layout";
-        let btn_w = draw.text_width(btn_label) + 12.0;
-        let btn_h = 15.0;
-        let btn_x = w - btn_w - 8.0;
-        let btn_y = (TOP_BAR_H - btn_h) * 0.5 - 0.5;
-        let btn_rect = [btn_x, btn_y, btn_w, btn_h];
-        let btn_hover = rect_contains(btn_rect, mouse);
-        draw_bordered_rect(
-            draw,
-            btn_rect,
-            if btn_hover {
-                theme.module_hover
-            } else {
-                theme.module_bg
-            },
-            if btn_hover { theme.accent } else { theme.border },
-        );
-        draw.text(btn_label, [btn_x + 6.0, btn_y + 3.5], theme.text, false);
-        self.hits.push(HitItem {
-            rect: btn_rect,
-            clip: None,
-            action: HitAction::ResetLayout,
-            tooltip: Some("Arrange all category panels neatly across the screen."),
-        });
+            // Search box to the left of Reset Layout (clamped so it never overlaps tabs)
+            let avail_right = reset_x - 8.0;
+            let avail_w = (avail_right - (tab_x + 8.0)).max(0.0);
+            if avail_w >= 72.0 {
+                let search_w = avail_w.min(185.0);
+                let search_h = 15.0;
+                let search_x = avail_right - search_w;
+                let search_y = (TOP_BAR_H - search_h) * 0.5 - 0.5;
+                let search_rect = [search_x, search_y, search_w, search_h];
+                let search_hover = rect_contains(search_rect, mouse);
 
-        // Controls hint at bottom of screen
-        let hint = if self.listening.is_some() {
-            "Listening for key... Press any key to bind, ESC/Backspace to clear."
-        } else {
-            "LMB Toggle  |  RMB Settings / Reset Slider  |  MMB Keybind  |  Scroll Adjust  |  ESC Close"
-        };
-        let hint_w = draw.text_width(hint);
-        let hint_x = ((w - hint_w) * 0.5).max(6.0);
-        let hint_y = size[1] - 14.0;
-        draw.fill(
-            [hint_x - 6.0, hint_y - 2.0, hint_w + 12.0, 12.0],
-            with_alpha(theme.panel_bg, 0xCC),
-        );
-        draw.text(
-            hint,
-            [hint_x, hint_y],
-            if self.listening.is_some() {
-                theme.accent
-            } else {
-                theme.text_muted
-            },
-            false,
-        );
+                let box_bg = if self.search_focused || search_hover {
+                    theme.module_hover
+                } else {
+                    theme.setting_bg
+                };
+                draw.fill(search_rect, box_bg);
+                draw_outline(
+                    draw,
+                    search_rect,
+                    if self.search_focused {
+                        theme.accent
+                    } else {
+                        theme.border
+                    },
+                );
+
+                // Clear button when search has text
+                let clear_space = if !self.search.is_empty() { 14.0 } else { 0.0 };
+                let text_max_w = search_w - 10.0 - clear_space;
+                let text_y = font.center_y(search_y, search_h);
+
+                // Only show placeholder when unfocused AND empty!
+                if !self.search_focused && self.search.is_empty() {
+                    font.draw_fitted(
+                        draw,
+                        "Search modules...",
+                        [search_x + 5.0, text_y],
+                        text_max_w,
+                        theme.text_muted,
+                        false,
+                        false,
+                    );
+                } else {
+                    let display = if self.search_focused {
+                        format!("{}|", self.search)
+                    } else {
+                        self.search.clone()
+                    };
+                    font.draw_fitted(
+                        draw,
+                        &display,
+                        [search_x + 5.0, text_y],
+                        text_max_w,
+                        theme.text,
+                        false,
+                        false,
+                    );
+                }
+
+                self.hits.push(HitRegion {
+                    rect: search_rect,
+                    kind: HitKind::SearchBar,
+                    tooltip: None,
+                });
+
+                if !self.search.is_empty() {
+                    let clr_rect = [search_x + search_w - 14.0, search_y, 14.0, search_h];
+                    let clr_hover = rect_contains(clr_rect, mouse);
+                    font.draw_body(
+                        draw,
+                        "x",
+                        [clr_rect[0] + 4.5, text_y],
+                        if clr_hover {
+                            theme.accent
+                        } else {
+                            theme.text_muted
+                        },
+                    );
+                    self.hits.push(HitRegion {
+                        rect: clr_rect,
+                        kind: HitKind::SearchClear,
+                        tooltip: Some("Clear search".into()),
+                    });
+                }
+            }
+        }
     }
 
-    fn draw_category_panel(
+    #[allow(clippy::too_many_arguments)]
+    fn render_panel(
         &mut self,
         draw: &mut dyn DrawContext,
+        category: Category,
         size: [f32; 2],
         mouse: [f32; 2],
         manager: &mut ModuleManager,
         theme: &Theme,
-        cat: Category,
+        font: FontConfig,
     ) {
-        let w = theme.panel_width;
-        let header_h = theme.header_height;
+        let gui_mod = manager.get(ModuleId::ClickGui);
+        let panel_w = gui_mod.int("panel_width", 154) as f32;
+        let row_h = gui_mod.int("row_height", 17) as f32;
+        let show_binds = gui_mod.bool("show_keybinds", true);
 
-        // Clamp panel position to stay visible
-        {
-            let panel = &mut manager.panels[cat.index()];
-            panel.x = panel.x.clamp(2.0, (size[0] - w - 2.0).max(2.0));
-            panel.y = panel
-                .y
-                .clamp(TOP_BAR_H + 4.0, (size[1] - header_h - 16.0).max(TOP_BAR_H + 4.0));
-        }
+        let panel = &mut manager.panels[category.index()];
+        panel.x = panel.x.clamp(4.0, (size[0] - panel_w - 4.0).max(4.0));
+        panel.y = panel
+            .y
+            .clamp(TOP_BAR_H + 4.0, (size[1] - HEADER_H - FOOTER_H - 4.0).max(TOP_BAR_H + 4.0));
+        let px = panel.x;
+        let py = panel.y;
+        let collapsed = panel.collapsed;
 
-        let panel_state = manager.panels[cat.index()];
-        let px = panel_state.x;
-        let py = panel_state.y;
-        let indices = manager.indices_in_category(cat, &self.search);
+        let mod_indices = manager.indices_in_category(category, &self.search);
+        let content_h = if mod_indices.is_empty() {
+            row_h + 6.0
+        } else {
+            let mut h = 0.0;
+            for &idx in &mod_indices {
+                h += row_h;
+                let m = &manager.modules[idx];
+                if m.expanded {
+                    h += module_drawer_height(m, true);
+                }
+            }
+            h + 2.0
+        };
+
+        let max_body_h = (size[1] - py - HEADER_H - FOOTER_H - 8.0).max(row_h);
+        let body_h = if collapsed {
+            0.0
+        } else {
+            content_h.min(max_body_h)
+        };
+        let max_scroll = (content_h - body_h).max(0.0);
+        let scroll = {
+            let p = &mut manager.panels[category.index()];
+            p.scroll = p.scroll.clamp(0.0, max_scroll);
+            p.scroll
+        };
+
+        let total_h = HEADER_H + body_h;
+        let panel_rect = [px, py, panel_w, total_h];
+
+        // Drop shadow
+        draw.fill([px + 2.0, py + 2.0, panel_w, total_h], 0x4800_0000);
 
         // Header bar
-        let header_rect = [px, py, w, header_h];
-        let header_hover = rect_contains(header_rect, mouse);
-        let hdr_top = if header_hover {
-            lighten(theme.header_bg, 10)
-        } else {
-            theme.header_bg
-        };
-        draw.fill_gradient(header_rect, hdr_top, theme.panel_bg);
-        // Top accent bar
-        draw.fill([px, py, w, 2.0], theme.accent);
-        // Subtle header bottom divider
-        draw.fill([px, py + header_h - 1.0, w, 1.0], theme.border);
+        let header_rect = [px, py, panel_w, HEADER_H];
+        draw.fill(header_rect, theme.header_bg);
+        draw.fill([px, py, panel_w, 1.5], theme.accent);
 
-        // Category badge pill
-        let badge_rect = [px + 5.0, py + (header_h - 11.0) * 0.5 + 0.5, 11.0, 11.0];
-        draw.fill(badge_rect, theme.accent_soft);
-        draw.text(
-            cat.badge(),
-            [badge_rect[0] + 3.0, badge_rect[1] + 1.5],
+        // Category icon pill
+        let badge_rect = [px + 5.0, py + 4.0, 11.0, 11.0];
+        draw.fill(badge_rect, with_alpha(theme.accent, 0x35));
+        let badge = category.badge();
+        let bw = font.width(draw, badge, font.bold_headers);
+        font.draw_header(
+            draw,
+            badge,
+            [
+                badge_rect[0] + (badge_rect[2] - bw) * 0.5,
+                font.center_y(badge_rect[1], badge_rect[3]),
+            ],
             theme.accent,
-            false,
         );
 
-        let text_y = py + (header_h - 8.0) * 0.5 + 0.5;
-        draw.text(cat.name(), [px + 20.0, text_y], theme.text, true);
+        let header_ty = font.center_y(py, HEADER_H);
+        font.draw_header(draw, category.name(), [px + 20.0, header_ty], theme.text);
 
-        let right_label = format!(
-            "{} {}",
-            indices.len(),
-            if panel_state.collapsed { "+" } else { "-" }
+        // Module count & collapse glyph
+        let count_str = format!("{}", mod_indices.len());
+        let cw = font.width(draw, &count_str, false);
+        font.draw_body(
+            draw,
+            &count_str,
+            [px + panel_w - 20.0 - cw, header_ty],
+            theme.text_muted,
         );
-        let rl_w = draw.text_width(&right_label);
-        draw.text(&right_label, [px + w - rl_w - 6.0, text_y], theme.text_muted, false);
 
-        self.hits.push(HitItem {
-            rect: header_rect,
-            clip: None,
-            action: HitAction::PanelHeader(cat),
-            tooltip: Some("Drag to move panel. Right-click to collapse or expand."),
+        let collapse_rect = [px + panel_w - 16.0, py, 16.0, HEADER_H];
+        let collapse_hover = rect_contains(collapse_rect, mouse);
+        let glyph = if collapsed { "+" } else { "-" };
+        font.draw_header(
+            draw,
+            glyph,
+            [px + panel_w - 11.0, header_ty],
+            if collapse_hover {
+                theme.accent
+            } else {
+                theme.text_muted
+            },
+        );
+
+        self.hits.push(HitRegion {
+            rect: [px, py, panel_w - 16.0, HEADER_H],
+            kind: HitKind::PanelHeader(category),
+            tooltip: None,
+        });
+        self.hits.push(HitRegion {
+            rect: collapse_rect,
+            kind: HitKind::PanelCollapse(category),
+            tooltip: None,
         });
 
-        if panel_state.collapsed {
+        if collapsed {
             draw_outline(draw, header_rect, theme.border);
             return;
         }
 
-        // Measure total content height
-        let content_h = self.measure_panel_content(manager, &indices, theme);
-        let max_body_h = (size[1] - (py + header_h) - 22.0).max(40.0);
-        let body_h = content_h.min(max_body_h).max(theme.row_height);
-        let max_scroll = (content_h - body_h).max(0.0);
-
-        let scroll = panel_state.scroll.clamp(0.0, max_scroll);
-        manager.panels[cat.index()].scroll = scroll;
-
-        let body_rect = [px, py + header_h, w, body_h];
+        // Panel body
+        let body_rect = [px, py + HEADER_H, panel_w, body_h];
         draw.fill(body_rect, theme.panel_bg);
+        self.panel_rects.push((category, body_rect, max_scroll));
 
-        self.hits.push(HitItem {
-            rect: body_rect,
-            clip: None,
-            action: HitAction::PanelBody(cat),
-            tooltip: None,
-        });
+        let clipped = draw.push_clip(body_rect).is_ok();
+        let mut cursor_y = py + HEADER_H - scroll;
 
-        let _ = draw.push_clip(body_rect);
-
-        if indices.is_empty() {
+        if mod_indices.is_empty() {
             let empty_msg = if self.search.is_empty() {
                 "No modules yet"
             } else {
                 "No matches"
             };
-            let tw = draw.text_width(empty_msg);
-            draw.text(
+            let ew = font.width(draw, empty_msg, false);
+            font.draw_body(
+                draw,
                 empty_msg,
                 [
-                    px + (w - tw) * 0.5,
-                    py + header_h + (body_h - 8.0) * 0.5,
+                    px + (panel_w - ew) * 0.5,
+                    font.center_y(cursor_y, row_h + 4.0),
                 ],
                 theme.text_muted,
-                false,
             );
         } else {
-            let mut cy = py + header_h - scroll;
-            let clip = Some(body_rect);
-            for &mod_idx in &indices {
-                cy = self.draw_module_block(
-                    draw,
-                    mouse,
-                    manager,
-                    theme,
-                    mod_idx,
-                    px,
-                    cy,
-                    w,
-                    clip,
-                );
-            }
-        }
+            for idx in mod_indices {
+                let row_rect = [px, cursor_y, panel_w, row_h];
+                let row_visible = cursor_y + row_h > body_rect[1] && cursor_y < body_rect[1] + body_rect[3];
+                let row_hover = row_visible && rect_contains(body_rect, mouse) && rect_contains(row_rect, mouse);
 
-        // Thin scrollbar indicator when overflowing
-        if max_scroll > 0.5 {
-            let bar_h = (body_h * (body_h / content_h)).clamp(14.0, body_h);
-            let bar_y = py + header_h + (scroll / max_scroll) * (body_h - bar_h);
-            draw.fill([px + w - 2.5, bar_y, 2.0, bar_h], theme.accent);
-        }
+                let m = &manager.modules[idx];
+                let enabled = m.enabled;
+                let expanded = m.expanded;
+                let mod_name = m.name;
+                let mod_desc = m.description;
+                let mod_bind = m.keybind.clone();
 
-        let _ = draw.pop_clip();
-
-        // Outer frame border around header + body
-        draw_outline(draw, [px, py, w, header_h + body_h], theme.border);
-    }
-
-    fn measure_panel_content(
-        &self,
-        manager: &ModuleManager,
-        indices: &[usize],
-        theme: &Theme,
-    ) -> f32 {
-        if indices.is_empty() {
-            return theme.row_height + 4.0;
-        }
-        let mut h = 0.0;
-        for &mod_idx in indices {
-            h += theme.row_height;
-            let module = &manager.modules[mod_idx];
-            if module.expanded {
-                for setting in &module.settings {
-                    if setting.group.is_some() {
-                        h += 12.0;
+                if row_visible {
+                    let row_bg = if enabled {
+                        if row_hover {
+                            with_alpha(theme.accent, 0x44)
+                        } else {
+                            theme.module_enabled_bg
+                        }
+                    } else if row_hover {
+                        theme.module_hover
+                    } else {
+                        0x0000_0000
+                    };
+                    if (row_bg >> 24) > 0 {
+                        draw.fill(row_rect, row_bg);
                     }
-                    h += theme.setting_height;
-                    if let SettingKind::Color { expanded: true, .. } = setting.kind {
-                        h += COLOR_DRAWER_H;
+                    if enabled {
+                        draw.fill([px, cursor_y, 2.0, row_h], theme.accent);
+                    }
+
+                    let listening_this = self.listening_bind == Some(BindTarget::Module(idx));
+                    let bind_label = if listening_this {
+                        Some("[...]".to_owned())
+                    } else if show_binds {
+                        mod_bind.as_deref().map(|k| format!("[{}]", format_key_name(Some(k))))
+                    } else {
+                        None
+                    };
+
+                    let chevron = if expanded { "v" } else { ">" };
+                    let chev_w = font.width(draw, chevron, false);
+                    let mut right_edge = px + panel_w - 6.0 - chev_w;
+                    let text_y = font.center_y(cursor_y, row_h);
+
+                    font.draw_body(
+                        draw,
+                        chevron,
+                        [right_edge, text_y],
+                        if expanded { theme.accent } else { theme.text_muted },
+                    );
+
+                    if let Some(bl) = bind_label {
+                        let bw = font.width(draw, &bl, false);
+                        right_edge -= bw + 5.0;
+                        font.draw_body(
+                            draw,
+                            &bl,
+                            [right_edge, text_y],
+                            if listening_this {
+                                theme.accent
+                            } else {
+                                theme.text_muted
+                            },
+                        );
+                    }
+
+                    let name_max_w = (right_edge - (px + 10.0)).max(20.0);
+                    font.draw_fitted(
+                        draw,
+                        mod_name,
+                        [px + 7.0, text_y],
+                        name_max_w,
+                        if enabled { theme.text } else { theme.text_muted },
+                        false,
+                        false,
+                    );
+
+                    if row_hover {
+                        self.hovered_tooltip = Some(mod_desc.to_owned());
+                    }
+
+                    if let Some(hit_rect) = intersect_rects(row_rect, body_rect) {
+                        self.hits.push(HitRegion {
+                            rect: hit_rect,
+                            kind: HitKind::ModuleRow(idx),
+                            tooltip: Some(mod_desc.to_owned()),
+                        });
                     }
                 }
-                h += 3.0;
+
+                cursor_y += row_h;
+
+                if expanded {
+                    cursor_y = self.render_settings_list(
+                        draw,
+                        idx,
+                        px,
+                        cursor_y,
+                        panel_w,
+                        body_rect,
+                        mouse,
+                        manager,
+                        theme,
+                        font,
+                        true,
+                    );
+                }
+
+                // Subtle separator
+                if cursor_y > body_rect[1] && cursor_y < body_rect[1] + body_rect[3] {
+                    draw.fill(
+                        [px + 4.0, cursor_y - 0.5, panel_w - 8.0, 0.5],
+                        with_alpha(theme.border, 0x60),
+                    );
+                }
             }
         }
-        h
+
+        if clipped {
+            let _ = draw.pop_clip();
+        }
+
+        // Scrollbar
+        if max_scroll > 0.5 {
+            let track_x = px + panel_w - 3.0;
+            let thumb_h = ((body_h / content_h) * body_h).clamp(14.0, body_h);
+            let thumb_y = py + HEADER_H + (scroll / max_scroll) * (body_h - thumb_h);
+            draw.fill([track_x, thumb_y, 2.0, thumb_h], with_alpha(theme.accent, 0xB8));
+        }
+
+        draw_outline(draw, panel_rect, theme.border);
     }
 
+    /// Renders the centered Settings or HUD page from the top navigation tabs.
     #[allow(clippy::too_many_arguments)]
-    fn draw_module_block(
+    fn render_settings_card(
         &mut self,
         draw: &mut dyn DrawContext,
-        mouse: [f32; 2],
-        manager: &ModuleManager,
-        theme: &Theme,
         mod_idx: usize,
-        x: f32,
-        mut y: f32,
-        w: f32,
-        clip: Option<[f32; 4]>,
-    ) -> f32 {
-        let module = &manager.modules[mod_idx];
-        let row_h = theme.row_height;
-        let row_rect = [x, y, w, row_h];
-        let hovered = clip.is_none_or(|c| rect_contains(c, mouse)) && rect_contains(row_rect, mouse);
+        title: &str,
+        subtitle: &str,
+        show_enable_toggle: bool,
+        size: [f32; 2],
+        mouse: [f32; 2],
+        manager: &mut ModuleManager,
+        theme: &Theme,
+        font: FontConfig,
+    ) {
+        let card_w = (size[0] - 48.0).clamp(240.0, 340.0);
+        let card_x = (size[0] - card_w) * 0.5;
+        let card_y = TOP_BAR_H + 12.0;
+        let max_card_h = (size[1] - card_y - FOOTER_H - 12.0).max(80.0);
+        let card_header_h = 30.0;
 
-        let is_config_only = module.id == ModuleId::ClickGui;
-        let row_bg = if module.enabled && !is_config_only {
-            if hovered {
-                blend_rgb(theme.module_hover, theme.accent, 0.30)
-            } else {
-                theme.module_enabled_bg
-            }
-        } else if hovered {
-            theme.module_hover
+        let content_h = module_drawer_height(&manager.modules[mod_idx], false) + 8.0;
+        let body_h = content_h.min(max_card_h - card_header_h).max(40.0);
+        let total_h = card_header_h + body_h;
+        let max_scroll = (content_h - body_h).max(0.0);
+
+        let scroll_ref = if self.active_tab == GuiTab::Settings {
+            &mut self.settings_scroll
         } else {
-            theme.module_bg
+            &mut self.hud_scroll
         };
-        draw.fill(row_rect, row_bg);
+        *scroll_ref = scroll_ref.clamp(0.0, max_scroll);
+        let scroll = *scroll_ref;
 
-        // Left active indicator bar
-        if module.enabled && !is_config_only {
-            draw.fill([x, y, 2.5, row_h], theme.accent);
-        } else if is_config_only {
-            draw.fill([x, y, 2.5, row_h], with_alpha(theme.accent, 0x80));
-        }
+        let card_rect = [card_x, card_y, card_w, total_h];
+        draw.fill([card_x + 3.0, card_y + 3.0, card_w, total_h], 0x5500_0000);
+        draw.fill([card_x, card_y, card_w, card_header_h], theme.header_bg);
+        draw.fill([card_x, card_y, card_w, 2.0], theme.accent);
 
-        // Bottom subtle separator
-        draw.fill(
-            [x + 2.0, y + row_h - 1.0, w - 4.0, 1.0],
-            with_alpha(theme.border, 0x45),
-        );
-
-        let text_y = y + (row_h - 8.0) * 0.5 + 0.5;
-        let listening_this = self.listening == Some(KeybindTarget::Module(mod_idx));
-
-        let label = if listening_this {
-            "Press key..."
-        } else {
-            module.name
-        };
-        let label_col = if listening_this {
-            theme.accent
-        } else if module.enabled && !is_config_only {
-            theme.text
-        } else {
-            theme.text_muted
-        };
-        draw.text(label, [x + 7.0, text_y], label_col, module.enabled && !is_config_only);
-
-        // Right-side expand chevron and optional keybind tag
-        let chevron = if module.expanded { "v" } else { ">" };
-        let chev_x = x + w - 10.0;
-        draw.text(
-            chevron,
-            [chev_x, text_y],
-            if module.expanded {
-                theme.accent
-            } else {
-                theme.text_muted
-            },
+        font.draw_header(draw, title, [card_x + 10.0, card_y + 6.0], theme.text);
+        font.draw_fitted(
+            draw,
+            subtitle,
+            [card_x + 10.0, card_y + 17.5],
+            card_w - 60.0,
+            theme.text_muted,
+            false,
             false,
         );
 
-        if theme.show_keybinds
-            && !listening_this
-            && let Some(bind) = module.keybind.as_deref()
-        {
-            let bind_txt = format!("[{}]", format_key_name(Some(bind)));
-            let bw = draw.text_width(&bind_txt);
-            draw.text(
-                &bind_txt,
-                [chev_x - bw - 4.0, text_y],
-                with_alpha(theme.accent, 0xD0),
+        if show_enable_toggle {
+            let enabled = manager.modules[mod_idx].enabled;
+            let sw_w = 22.0;
+            let sw_h = 11.0;
+            let sw_x = card_x + card_w - sw_w - 10.0;
+            let sw_y = card_y + (card_header_h - sw_h) * 0.5;
+            let sw_rect = [sw_x, sw_y, sw_w, sw_h];
+            draw.fill(
+                sw_rect,
+                if enabled {
+                    theme.accent
+                } else {
+                    theme.slider_track
+                },
+            );
+            let knob_x = if enabled { sw_x + sw_w - 9.0 } else { sw_x + 1.5 };
+            draw.fill([knob_x, sw_y + 1.5, 7.5, sw_h - 3.0], 0xFFFF_FFFF);
+            self.hits.push(HitRegion {
+                rect: sw_rect,
+                kind: HitKind::ToggleModuleEnabled(mod_idx),
+                tooltip: Some("Enable or disable the HUD overlay.".into()),
+            });
+        }
+
+        let body_rect = [card_x, card_y + card_header_h, card_w, body_h];
+        draw.fill(body_rect, theme.panel_bg);
+        self.card_scroll_rect = Some((body_rect, max_scroll));
+
+        let clipped = draw.push_clip(body_rect).is_ok();
+        let _ = self.render_settings_list(
+            draw,
+            mod_idx,
+            card_x,
+            card_y + card_header_h + 2.0 - scroll,
+            card_w,
+            body_rect,
+            mouse,
+            manager,
+            theme,
+            font,
+            false,
+        );
+        if clipped {
+            let _ = draw.pop_clip();
+        }
+
+        if max_scroll > 0.5 {
+            let track_x = card_x + card_w - 3.5;
+            let thumb_h = ((body_h / content_h) * body_h).clamp(16.0, body_h);
+            let thumb_y = body_rect[1] + (scroll / max_scroll) * (body_h - thumb_h);
+            draw.fill([track_x, thumb_y, 2.5, thumb_h], with_alpha(theme.accent, 0xC4));
+        }
+
+        draw_outline(draw, card_rect, theme.border);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_settings_list(
+        &mut self,
+        draw: &mut dyn DrawContext,
+        mod_idx: usize,
+        px: f32,
+        mut y: f32,
+        w: f32,
+        clip: [f32; 4],
+        mouse: [f32; 2],
+        manager: &ModuleManager,
+        theme: &Theme,
+        font: FontConfig,
+        show_module_bind: bool,
+    ) -> f32 {
+        let m = &manager.modules[mod_idx];
+        let drawer_h = module_drawer_height(m, show_module_bind);
+        draw.fill([px, y, w, drawer_h], theme.setting_bg);
+        draw.fill([px, y, 1.5, drawer_h], with_alpha(theme.accent, 0x70));
+
+        // Optional per-module keybind row (on Modules tab)
+        if show_module_bind && m.id != ModuleId::ClickGui {
+            let bind_rect = [px, y, w, SETTING_H];
+            let vis = y + SETTING_H > clip[1] && y < clip[1] + clip[3];
+            let hover = vis && rect_contains(clip, mouse) && rect_contains(bind_rect, mouse);
+            if vis {
+                if hover {
+                    draw.fill(bind_rect, theme.module_hover);
+                    self.hovered_tooltip =
+                        Some("Click to assign a toggle keybind (ESC/Backspace to clear).".into());
+                }
+                let listening = self.listening_bind == Some(BindTarget::Module(mod_idx));
+                let val_str = if listening {
+                    "Press key...".to_owned()
+                } else {
+                    format_key_name(m.keybind.as_deref())
+                };
+                let vw = font.width(draw, &val_str, false);
+                let ty = font.center_y(y, SETTING_H);
+                font.draw_body(draw, "Bind", [px + 7.0, ty], theme.text_muted);
+                font.draw_value(
+                    draw,
+                    &val_str,
+                    [px + w - 7.0 - vw, ty],
+                    if listening { theme.accent } else { theme.text },
+                );
+                if let Some(hit) = intersect_rects(bind_rect, clip) {
+                    self.hits.push(HitRegion {
+                        rect: hit,
+                        kind: HitKind::ModuleBind(mod_idx),
+                        tooltip: None,
+                    });
+                }
+            }
+            y += SETTING_H;
+        }
+
+        let mut last_group: Option<&str> = None;
+        for (set_idx, setting) in m.settings.iter().enumerate() {
+            if let Some(grp) = setting.group
+                && last_group != Some(grp)
+            {
+                last_group = Some(grp);
+                if y + GROUP_H > clip[1] && y < clip[1] + clip[3] {
+                    let gy = font.center_y(y, GROUP_H);
+                    let gw = font.width(draw, grp, font.bold_headers);
+                    font.draw_header(draw, grp, [px + 7.0, gy], with_alpha(theme.accent, 0xDF));
+                    let line_x = px + 11.0 + gw;
+                    if line_x < px + w - 8.0 {
+                        draw.fill(
+                            [line_x, y + GROUP_H * 0.52, px + w - 7.0 - line_x, 0.7],
+                            with_alpha(theme.accent, 0x45),
+                        );
+                    }
+                }
+                y += GROUP_H;
+            }
+
+            let row_rect = [px, y, w, SETTING_H];
+            let vis = y + SETTING_H > clip[1] && y < clip[1] + clip[3];
+            let hover = vis && rect_contains(clip, mouse) && rect_contains(row_rect, mouse);
+            let ty = font.center_y(y, SETTING_H);
+
+            if hover {
+                self.hovered_tooltip = Some(setting.description.to_owned());
+            }
+
+            match &setting.kind {
+                SettingKind::Bool { value, .. } => {
+                    if vis {
+                        if hover {
+                            draw.fill(row_rect, theme.module_hover);
+                        }
+                        let sw_w = 18.0;
+                        let sw_h = 9.0;
+                        let sw_x = px + w - sw_w - 7.0;
+                        let sw_y = y + (SETTING_H - sw_h) * 0.5;
+                        let label_max = (sw_x - (px + 11.0)).max(20.0);
+                        font.draw_fitted(
+                            draw,
+                            setting.name,
+                            [px + 7.0, ty],
+                            label_max,
+                            if *value { theme.text } else { theme.text_muted },
+                            false,
+                            false,
+                        );
+                        draw.fill(
+                            [sw_x, sw_y, sw_w, sw_h],
+                            if *value {
+                                theme.accent
+                            } else {
+                                theme.slider_track
+                            },
+                        );
+                        let knob_x = if *value { sw_x + sw_w - 8.0 } else { sw_x + 1.0 };
+                        draw.fill([knob_x, sw_y + 1.0, 7.0, sw_h - 2.0], 0xFFFF_FFFF);
+                        if let Some(hit) = intersect_rects(row_rect, clip) {
+                            self.hits.push(HitRegion {
+                                rect: hit,
+                                kind: HitKind::SettingBool { mod_idx, set_idx },
+                                tooltip: Some(setting.description.to_owned()),
+                            });
+                        }
+                    }
+                    y += SETTING_H;
+                }
+
+                SettingKind::Float { .. } | SettingKind::Int { .. } => {
+                    if vis {
+                        let frac = setting.slider_fraction().unwrap_or(0.0);
+                        let bar_rect = [px + 5.0, y + 2.0, w - 10.0, SETTING_H - 4.0];
+                        draw.fill(bar_rect, theme.slider_track);
+                        let fill_w = bar_rect[2] * frac;
+                        if fill_w > 0.5 {
+                            draw.fill(
+                                [bar_rect[0], bar_rect[1], fill_w, bar_rect[3]],
+                                with_alpha(theme.accent, if hover { 0xC8 } else { 0x98 }),
+                            );
+                        }
+                        let val_str = setting.display_value();
+                        let vw = font.width(draw, &val_str, false);
+                        let label_max = (bar_rect[2] - vw - 10.0).max(20.0);
+                        font.draw_fitted(
+                            draw,
+                            setting.name,
+                            [bar_rect[0] + 4.0, ty],
+                            label_max,
+                            theme.text,
+                            false,
+                            false,
+                        );
+                        font.draw_value(
+                            draw,
+                            &val_str,
+                            [bar_rect[0] + bar_rect[2] - vw - 4.0, ty],
+                            theme.text,
+                        );
+                        if let Some(hit) = intersect_rects(row_rect, clip) {
+                            self.hits.push(HitRegion {
+                                rect: hit,
+                                kind: HitKind::SettingSlider { mod_idx, set_idx },
+                                tooltip: Some(setting.description.to_owned()),
+                            });
+                        }
+                    }
+                    y += SETTING_H;
+                }
+
+                SettingKind::Mode { .. } => {
+                    if vis {
+                        if hover {
+                            draw.fill(row_rect, theme.module_hover);
+                        }
+                        let val_str = format!("< {} >", setting.display_value());
+                        let vw = font.width(draw, &val_str, false);
+                        let val_x = (px + w - 7.0 - vw).max(px + w * 0.45);
+                        let label_max = (val_x - (px + 10.0)).max(20.0);
+                        font.draw_fitted(
+                            draw,
+                            setting.name,
+                            [px + 7.0, ty],
+                            label_max,
+                            theme.text_muted,
+                            false,
+                            false,
+                        );
+                        font.draw_fitted(
+                            draw,
+                            &val_str,
+                            [val_x, ty],
+                            (px + w - 7.0 - val_x).max(16.0),
+                            theme.accent,
+                            false,
+                            font.italic_values,
+                        );
+                        if let Some(hit) = intersect_rects(row_rect, clip) {
+                            self.hits.push(HitRegion {
+                                rect: hit,
+                                kind: HitKind::SettingMode { mod_idx, set_idx },
+                                tooltip: Some(setting.description.to_owned()),
+                            });
+                        }
+                    }
+                    y += SETTING_H;
+                }
+
+                SettingKind::EntityFilter { value, .. } => {
+                    if vis {
+                        if hover {
+                            draw.fill(row_rect, theme.module_hover);
+                        }
+                        let badge = format!("{}  >", value.summary());
+                        let bw = font.width(draw, &badge, false);
+                        let pill_w = (bw + 10.0).min(w * 0.56);
+                        let pill_h = SETTING_H - 4.0;
+                        let pill_x = px + w - pill_w - 6.0;
+                        let pill_y = y + 2.0;
+                        let pill_rect = [pill_x, pill_y, pill_w, pill_h];
+
+                        draw.fill(
+                            pill_rect,
+                            if hover {
+                                with_alpha(theme.accent, 0x45)
+                            } else {
+                                with_alpha(theme.accent, 0x28)
+                            },
+                        );
+                        draw_outline(draw, pill_rect, with_alpha(theme.accent, 0x90));
+
+                        let label_max = (pill_x - (px + 11.0)).max(20.0);
+                        font.draw_fitted(
+                            draw,
+                            setting.name,
+                            [px + 7.0, ty],
+                            label_max,
+                            theme.text,
+                            false,
+                            false,
+                        );
+                        font.draw_fitted(
+                            draw,
+                            &badge,
+                            [pill_x + 5.0, font.center_y(pill_y, pill_h)],
+                            pill_w - 8.0,
+                            theme.text,
+                            false,
+                            false,
+                        );
+
+                        if let Some(hit) = intersect_rects(row_rect, clip) {
+                            self.hits.push(HitRegion {
+                                rect: hit,
+                                kind: HitKind::SettingEntityFilter { mod_idx, set_idx },
+                                tooltip: Some(setting.description.to_owned()),
+                            });
+                        }
+                    }
+                    y += SETTING_H;
+                }
+
+                SettingKind::Color {
+                    value, expanded, ..
+                } => {
+                    if vis {
+                        if hover {
+                            draw.fill(row_rect, theme.module_hover);
+                        }
+                        let sw = [px + w - 18.0, y + 3.0, 11.0, SETTING_H - 6.0];
+                        let label_max = (sw[0] - (px + 11.0)).max(20.0);
+                        font.draw_fitted(
+                            draw,
+                            setting.name,
+                            [px + 7.0, ty],
+                            label_max,
+                            theme.text_muted,
+                            false,
+                            false,
+                        );
+                        draw.fill(sw, *value);
+                        draw_outline(draw, sw, theme.border);
+                        if let Some(hit) = intersect_rects(row_rect, clip) {
+                            self.hits.push(HitRegion {
+                                rect: hit,
+                                kind: HitKind::SettingColorHeader { mod_idx, set_idx },
+                                tooltip: Some(setting.description.to_owned()),
+                            });
+                        }
+                    }
+                    y += SETTING_H;
+
+                    if *expanded {
+                        let channels = [
+                            ("R", ((*value >> 16) & 0xFF) as u8, 0xFFD9_4A4A_u32),
+                            ("G", ((*value >> 8) & 0xFF) as u8, 0xFF45_C96A_u32),
+                            ("B", (*value & 0xFF) as u8, 0xFF4D_8CF5_u32),
+                            ("A", ((*value >> 24) & 0xFF) as u8, 0xFFB8_B8C8_u32),
+                        ];
+                        for (ci, (label, val, col)) in channels.into_iter().enumerate() {
+                            let c_rect = [px + 8.0, y + 1.0, w - 16.0, COLOR_CHANNEL_H - 2.0];
+                            if y + COLOR_CHANNEL_H > clip[1] && y < clip[1] + clip[3] {
+                                draw.fill(c_rect, theme.slider_track);
+                                let frac = val as f32 / 255.0;
+                                draw.fill(
+                                    [c_rect[0], c_rect[1], c_rect[2] * frac, c_rect[3]],
+                                    with_alpha(col, 0xB8),
+                                );
+                                let cty = font.center_y(c_rect[1], c_rect[3]);
+                                font.draw_body(draw, label, [c_rect[0] + 3.0, cty], theme.text);
+                                let vstr = format!("{val}");
+                                let vw = font.width(draw, &vstr, false);
+                                font.draw_value(
+                                    draw,
+                                    &vstr,
+                                    [c_rect[0] + c_rect[2] - vw - 3.0, cty],
+                                    theme.text,
+                                );
+                                if let Some(hit) = intersect_rects(c_rect, clip) {
+                                    self.hits.push(HitRegion {
+                                        rect: hit,
+                                        kind: HitKind::SettingColorChannel {
+                                            mod_idx,
+                                            set_idx,
+                                            channel: ci as u8,
+                                        },
+                                        tooltip: None,
+                                    });
+                                }
+                            }
+                            y += COLOR_CHANNEL_H;
+                        }
+                        y += 4.0;
+                    }
+                }
+
+                SettingKind::Keybind { .. } => {
+                    if vis {
+                        if hover {
+                            draw.fill(row_rect, theme.module_hover);
+                        }
+                        let listening =
+                            self.listening_bind == Some(BindTarget::Setting { mod_idx, set_idx });
+                        let val_str = if listening {
+                            "Press key...".to_owned()
+                        } else {
+                            setting.display_value()
+                        };
+                        let vw = font.width(draw, &val_str, false);
+                        let label_max = (w - vw - 18.0).max(20.0);
+                        font.draw_fitted(
+                            draw,
+                            setting.name,
+                            [px + 7.0, ty],
+                            label_max,
+                            theme.text_muted,
+                            false,
+                            false,
+                        );
+                        font.draw_value(
+                            draw,
+                            &val_str,
+                            [px + w - 7.0 - vw, ty],
+                            if listening { theme.accent } else { theme.text },
+                        );
+                        if let Some(hit) = intersect_rects(row_rect, clip) {
+                            self.hits.push(HitRegion {
+                                rect: hit,
+                                kind: HitKind::SettingKeybind { mod_idx, set_idx },
+                                tooltip: Some(setting.description.to_owned()),
+                            });
+                        }
+                    }
+                    y += SETTING_H;
+                }
+            }
+        }
+
+        y
+    }
+
+    /// Renders the floating Entity Selector modal window for picking exact entity types.
+    fn render_entity_picker(
+        &mut self,
+        draw: &mut dyn DrawContext,
+        size: [f32; 2],
+        mouse: [f32; 2],
+        manager: &ModuleManager,
+        theme: &Theme,
+        font: FontConfig,
+    ) {
+        let Some(picker) = self.entity_picker.clone() else {
+            return;
+        };
+        let Some(module) = manager.modules.get(picker.mod_idx) else {
+            self.entity_picker = None;
+            return;
+        };
+        let Some(setting) = module.settings.get(picker.set_idx) else {
+            self.entity_picker = None;
+            return;
+        };
+        let Some(filter) = setting.as_entity_filter() else {
+            self.entity_picker = None;
+            return;
+        };
+
+        // Dim background behind modal
+        draw.fill([0.0, 0.0, size[0], size[1]], 0x7A00_0000);
+
+        let mw = (size[0] - 40.0).clamp(260.0, 340.0);
+        let mh = (size[1] - 44.0).clamp(180.0, 290.0);
+        let mx = (size[0] - mw) * 0.5;
+        let my = (size[1] - mh) * 0.5;
+        let modal_rect = [mx, my, mw, mh];
+        self.picker_window_rect = Some(modal_rect);
+
+        draw.fill([mx + 3.0, my + 3.0, mw, mh], 0x6000_0000);
+        draw.fill(modal_rect, with_alpha(theme.panel_bg, 0xF8));
+        draw.fill([mx, my, mw, 22.0], theme.header_bg);
+        draw.fill([mx, my, mw, 2.0], theme.accent);
+
+        // Header title & close X
+        let title = format!("{}  -  {}", module.name, setting.name);
+        font.draw_header(
+            draw,
+            &title,
+            [mx + 9.0, font.center_y(my, 22.0)],
+            theme.text,
+        );
+        let close_rect = [mx + mw - 20.0, my + 2.0, 18.0, 18.0];
+        let close_hover = rect_contains(close_rect, mouse);
+        if close_hover {
+            draw.fill(close_rect, with_alpha(theme.accent, 0x40));
+        }
+        font.draw_header(
+            draw,
+            "x",
+            [close_rect[0] + 6.5, font.center_y(close_rect[1], close_rect[3])],
+            if close_hover { theme.accent } else { theme.text_muted },
+        );
+        self.hits.push(HitRegion {
+            rect: close_rect,
+            kind: HitKind::PickerClose,
+            tooltip: None,
+        });
+
+        // Search input row
+        let mut cy = my + 27.0;
+        let search_h = 16.0;
+        let search_rect = [mx + 8.0, cy, mw - 16.0, search_h];
+        let search_hover = rect_contains(search_rect, mouse);
+        draw.fill(
+            search_rect,
+            if picker.search_focused || search_hover {
+                theme.module_hover
+            } else {
+                theme.setting_bg
+            },
+        );
+        draw_outline(
+            draw,
+            search_rect,
+            if picker.search_focused {
+                theme.accent
+            } else {
+                theme.border
+            },
+        );
+        let sty = font.center_y(cy, search_h);
+        let clear_pad = if !picker.search.is_empty() { 15.0 } else { 0.0 };
+        if !picker.search_focused && picker.search.is_empty() {
+            font.draw_fitted(
+                draw,
+                "Search entities...",
+                [search_rect[0] + 5.0, sty],
+                search_rect[2] - 10.0,
+                theme.text_muted,
+                false,
+                false,
+            );
+        } else {
+            let disp = if picker.search_focused {
+                format!("{}|", picker.search)
+            } else {
+                picker.search.clone()
+            };
+            font.draw_fitted(
+                draw,
+                &disp,
+                [search_rect[0] + 5.0, sty],
+                search_rect[2] - 10.0 - clear_pad,
+                theme.text,
+                false,
                 false,
             );
         }
-
-        self.hits.push(HitItem {
-            rect: row_rect,
-            clip,
-            action: HitAction::ModuleRow(mod_idx),
-            tooltip: Some(module.description),
+        self.hits.push(HitRegion {
+            rect: search_rect,
+            kind: HitKind::PickerSearchBar,
+            tooltip: None,
         });
-
-        y += row_h;
-
-        if !module.expanded {
-            return y;
+        if !picker.search.is_empty() {
+            let clr = [search_rect[0] + search_rect[2] - 14.0, cy, 14.0, search_h];
+            font.draw_body(draw, "x", [clr[0] + 4.5, sty], theme.text_muted);
+            self.hits.push(HitRegion {
+                rect: clr,
+                kind: HitKind::PickerSearchClear,
+                tooltip: None,
+            });
         }
+        cy += search_h + 5.0;
 
-        // Settings drawer background
-        let drawer_start = y;
-        let set_h = theme.setting_height;
-        let pad_x = 6.0;
-        let inner_x = x + pad_x;
-        let inner_w = w - pad_x - 4.0;
+        // Quick-select preset chips: [All] [None] | [Players] [Hostile] [Neutral] [Passive] [Misc]
+        let chip_h = 13.5;
+        let mut cx = mx + 8.0;
+        let quick_actions: [(&str, HitKind, bool, u32); 7] = [
+            ("All", HitKind::PickerSelectAll, false, theme.accent),
+            ("None", HitKind::PickerSelectNone, false, theme.accent),
+            (
+                "Players",
+                HitKind::PickerToggleGroup(EntityGroup::Players),
+                filter.group_fully_selected(EntityGroup::Players),
+                EntityGroup::Players.color(theme.accent),
+            ),
+            (
+                "Hostile",
+                HitKind::PickerToggleGroup(EntityGroup::Hostile),
+                filter.group_fully_selected(EntityGroup::Hostile),
+                EntityGroup::Hostile.color(theme.accent),
+            ),
+            (
+                "Neutral",
+                HitKind::PickerToggleGroup(EntityGroup::Neutral),
+                filter.group_fully_selected(EntityGroup::Neutral),
+                EntityGroup::Neutral.color(theme.accent),
+            ),
+            (
+                "Passive",
+                HitKind::PickerToggleGroup(EntityGroup::Passive),
+                filter.group_fully_selected(EntityGroup::Passive),
+                EntityGroup::Passive.color(theme.accent),
+            ),
+            (
+                "Misc",
+                HitKind::PickerToggleGroup(EntityGroup::Misc),
+                filter.group_fully_selected(EntityGroup::Misc),
+                EntityGroup::Misc.color(theme.accent),
+            ),
+        ];
 
-        for (set_idx, setting) in module.settings.iter().enumerate() {
-            if let Some(group) = setting.group {
-                let grp_rect = [x, y, w, 12.0];
-                draw.fill(grp_rect, theme.setting_bg);
-                draw.fill([x, y, 2.0, 12.0], with_alpha(theme.accent, 0x55));
-                draw.text(group, [inner_x, y + 2.5], theme.accent, false);
-                let gw = draw.text_width(group);
-                let line_x = inner_x + gw + 4.0;
-                if line_x < x + w - 6.0 {
-                    draw.fill(
-                        [line_x, y + 6.5, (x + w - 6.0) - line_x, 1.0],
-                        with_alpha(theme.accent, 0x45),
-                    );
-                }
-                y += 12.0;
+        for (label, kind, active, col) in quick_actions {
+            let cw = font.width(draw, label, false) + 9.0;
+            if cx + cw > mx + mw - 8.0 {
+                cx = mx + 8.0;
+                cy += chip_h + 3.0;
             }
-
-            let row_rect = [x, y, w, set_h];
-            let s_hover =
-                clip.is_none_or(|c| rect_contains(c, mouse)) && rect_contains(row_rect, mouse);
+            let rect = [cx, cy, cw, chip_h];
+            let hover = rect_contains(rect, mouse);
             draw.fill(
-                row_rect,
-                if s_hover {
-                    lighten(theme.setting_bg, 8)
+                rect,
+                if active {
+                    with_alpha(col, 0x45)
+                } else if hover {
+                    theme.module_hover
                 } else {
                     theme.setting_bg
                 },
             );
-            draw.fill([x, y, 2.0, set_h], with_alpha(theme.accent, 0x60));
+            draw_outline(
+                draw,
+                rect,
+                if active { col } else { theme.border },
+            );
+            font.draw_body(
+                draw,
+                label,
+                [cx + 4.5, font.center_y(cy, chip_h)],
+                if active || hover { theme.text } else { theme.text_muted },
+            );
+            self.hits.push(HitRegion {
+                rect,
+                kind,
+                tooltip: None,
+            });
+            cx += cw + 3.0;
+        }
+        cy += chip_h + 5.0;
 
-            let sty = y + (set_h - 8.0) * 0.5 + 0.5;
+        // Filter view tabs: All | Selected (N) | Groups
+        let tab_h = 13.0;
+        let mut tx = mx + 8.0;
+        let selected_label = format!("Selected ({})", filter.len());
+        let filter_tabs: Vec<(String, PickerFilter)> = vec![
+            ("Show All".into(), PickerFilter::All),
+            (selected_label, PickerFilter::Selected),
+            ("Players".into(), PickerFilter::Group(EntityGroup::Players)),
+            ("Hostile".into(), PickerFilter::Group(EntityGroup::Hostile)),
+            ("Neutral".into(), PickerFilter::Group(EntityGroup::Neutral)),
+            ("Passive".into(), PickerFilter::Group(EntityGroup::Passive)),
+            ("Misc".into(), PickerFilter::Group(EntityGroup::Misc)),
+        ];
+        for (label, flt) in filter_tabs {
+            let tw = font.width(draw, &label, false) + 7.0;
+            if tx + tw > mx + mw - 8.0 {
+                break;
+            }
+            let rect = [tx, cy, tw, tab_h];
+            let active = picker.filter == flt;
+            let hover = rect_contains(rect, mouse);
+            if active {
+                draw.fill([tx, cy + tab_h - 1.5, tw, 1.5], theme.accent);
+            }
+            font.draw_body(
+                draw,
+                &label,
+                [tx + 3.5, font.center_y(cy, tab_h)],
+                if active {
+                    theme.accent
+                } else if hover {
+                    theme.text
+                } else {
+                    theme.text_muted
+                },
+            );
+            self.hits.push(HitRegion {
+                rect,
+                kind: HitKind::PickerFilterTab(flt),
+                tooltip: None,
+            });
+            tx += tw + 2.0;
+        }
+        cy += tab_h + 4.0;
 
-            match &setting.kind {
-                SettingKind::Bool { value, .. } => {
-                    draw.text(
-                        setting.name,
-                        [inner_x, sty],
-                        if *value { theme.text } else { theme.text_muted },
-                        false,
-                    );
-                    let pill_w = 18.0;
-                    let pill_h = 9.0;
-                    let pill_x = x + w - pill_w - 6.0;
-                    let pill_y = y + (set_h - pill_h) * 0.5;
-                    draw.fill(
-                        [pill_x, pill_y, pill_w, pill_h],
-                        if *value {
-                            theme.accent
-                        } else {
-                            theme.slider_track
-                        },
-                    );
-                    let knob_x = if *value {
-                        pill_x + pill_w - 8.0
-                    } else {
-                        pill_x + 1.0
-                    };
-                    draw.fill([knob_x, pill_y + 1.0, 7.0, 7.0], 0xFFFF_FFFF);
+        // Scrollable 2-column entity checklist
+        let footer_bar_h = 22.0;
+        let list_rect = [mx + 8.0, cy, mw - 16.0, (my + mh - footer_bar_h - cy - 4.0).max(40.0)];
+        draw.fill(list_rect, theme.setting_bg);
+        draw_outline(draw, list_rect, theme.border);
 
-                    self.hits.push(HitItem {
-                        rect: row_rect,
-                        clip,
-                        action: HitAction::SettingBool { mod_idx, set_idx },
-                        tooltip: Some(setting.description),
-                    });
+        let q = picker.search.trim().to_ascii_lowercase();
+        let entries: Vec<&entity_filter::EntityEntry> = entity_filter::catalog()
+            .iter()
+            .filter(|e| {
+                let pass_tab = match picker.filter {
+                    PickerFilter::All => true,
+                    PickerFilter::Selected => filter.contains(&e.id),
+                    PickerFilter::Group(g) => e.group == g,
+                };
+                if !pass_tab {
+                    return false;
                 }
-                SettingKind::Float { .. } | SettingKind::Int { .. } => {
-                    let frac = setting.slider_fraction().unwrap_or(0.0);
-                    let track_x = inner_x;
-                    let track_w = inner_w;
-                    let fill_rect = [track_x, y + 1.5, track_w, set_h - 3.0];
-                    draw.fill(fill_rect, with_alpha(theme.slider_track, 0x70));
-                    if frac > 0.001 {
-                        draw.fill(
-                            [track_x, y + 1.5, track_w * frac, set_h - 3.0],
-                            with_alpha(theme.accent, 0xA8),
-                        );
-                        draw.fill(
-                            [
-                                (track_x + track_w * frac - 1.5).max(track_x),
-                                y + 1.5,
-                                1.5,
-                                set_h - 3.0,
-                            ],
-                            theme.accent,
-                        );
-                    }
-                    draw.text(setting.name, [track_x + 3.0, sty], theme.text, false);
-                    let val_str = setting.display_value();
-                    let vw = draw.text_width(&val_str);
-                    draw.text(&val_str, [track_x + track_w - vw - 3.0, sty], theme.text, false);
+                q.is_empty()
+                    || e.display.to_ascii_lowercase().contains(&q)
+                    || e.id.to_ascii_lowercase().contains(&q)
+            })
+            .collect();
 
-                    self.hits.push(HitItem {
-                        rect: row_rect,
-                        clip,
-                        action: HitAction::SettingSlider {
-                            mod_idx,
-                            set_idx,
-                            track_x,
-                            track_w,
-                        },
-                        tooltip: Some(setting.description),
-                    });
+        let cols = 2usize;
+        let item_h = 15.5;
+        let rows = entries.len().div_ceil(cols);
+        let content_h = (rows as f32 * item_h + 6.0).max(item_h);
+        let max_scroll = (content_h - list_rect[3]).max(0.0);
+        let scroll = picker.scroll.clamp(0.0, max_scroll);
+        if let Some(st) = &mut self.entity_picker {
+            st.scroll = scroll;
+        }
+        self.picker_list_rect = Some((list_rect, max_scroll));
+
+        let clipped = draw.push_clip(list_rect).is_ok();
+        if entries.is_empty() {
+            let msg = "No matching entities";
+            let ew = font.width(draw, msg, false);
+            font.draw_body(
+                draw,
+                msg,
+                [
+                    list_rect[0] + (list_rect[2] - ew) * 0.5,
+                    list_rect[1] + 14.0,
+                ],
+                theme.text_muted,
+            );
+        } else {
+            let col_w = (list_rect[2] - 8.0) / cols as f32;
+            for (i, entry) in entries.iter().enumerate() {
+                let row = i / cols;
+                let col = i % cols;
+                let ix = list_rect[0] + 3.0 + col as f32 * col_w;
+                let iy = list_rect[1] + 3.0 + row as f32 * item_h - scroll;
+                if iy + item_h < list_rect[1] || iy > list_rect[1] + list_rect[3] {
+                    continue;
                 }
-                SettingKind::Mode { .. } => {
-                    draw.text(setting.name, [inner_x, sty], theme.text_muted, false);
-                    let val_str = format!("< {} >", setting.display_value());
-                    let vw = draw.text_width(&val_str);
-                    draw.text(
-                        &val_str,
-                        [x + w - vw - 5.0, sty],
-                        theme.accent,
-                        false,
-                    );
-                    self.hits.push(HitItem {
-                        rect: row_rect,
-                        clip,
-                        action: HitAction::SettingMode { mod_idx, set_idx },
-                        tooltip: Some(setting.description),
-                    });
+                let cell = [ix, iy, col_w - 3.0, item_h - 1.5];
+                let hover = rect_contains(list_rect, mouse) && rect_contains(cell, mouse);
+                let checked = filter.contains(&entry.id);
+                let gcol = entry.group.color(theme.accent);
+
+                if checked {
+                    draw.fill(cell, with_alpha(gcol, if hover { 0x3C } else { 0x24 }));
+                } else if hover {
+                    draw.fill(cell, theme.module_hover);
                 }
-                SettingKind::Keybind { .. } => {
-                    let listening_set =
-                        self.listening == Some(KeybindTarget::Setting { mod_idx, set_idx });
-                    draw.text(setting.name, [inner_x, sty], theme.text_muted, false);
-                    let val_str = if listening_set {
-                        "Press key...".to_owned()
-                    } else {
-                        setting.display_value()
-                    };
-                    let vw = draw.text_width(&val_str);
-                    draw.text(
-                        &val_str,
-                        [x + w - vw - 5.0, sty],
-                        if listening_set {
-                            theme.accent
-                        } else {
-                            theme.text
-                        },
-                        false,
-                    );
-                    self.hits.push(HitItem {
-                        rect: row_rect,
-                        clip,
-                        action: HitAction::SettingKeybind { mod_idx, set_idx },
-                        tooltip: Some(setting.description),
-                    });
+
+                // Checkbox square
+                let cb = [ix + 3.0, iy + (cell[3] - 8.0) * 0.5, 8.0, 8.0];
+                draw.fill(cb, if checked { gcol } else { theme.slider_track });
+                if checked {
+                    draw.fill([cb[0] + 2.0, cb[1] + 2.0, 4.0, 4.0], 0xFFFF_FFFF);
+                } else {
+                    draw_outline(draw, cb, theme.border);
                 }
-                SettingKind::Color {
-                    value, expanded, ..
-                } => {
-                    draw.text(setting.name, [inner_x, sty], theme.text_muted, false);
-                    let swatch_rect = [x + w - 20.0, y + 2.5, 14.0, set_h - 5.0];
-                    draw_bordered_rect(draw, swatch_rect, *value, theme.border);
 
-                    self.hits.push(HitItem {
-                        rect: row_rect,
-                        clip,
-                        action: HitAction::SettingColorHeader { mod_idx, set_idx },
-                        tooltip: Some(setting.description),
+                let text_x = ix + 14.0;
+                let text_max = (cell[2] - 17.0).max(16.0);
+                font.draw_fitted(
+                    draw,
+                    &entry.display,
+                    [text_x, font.center_y(iy, cell[3])],
+                    text_max,
+                    if checked { theme.text } else { theme.text_muted },
+                    false,
+                    false,
+                );
+
+                if let Some(hit) = intersect_rects(cell, list_rect) {
+                    self.hits.push(HitRegion {
+                        rect: hit,
+                        kind: HitKind::PickerEntityToggle(entry.id.clone()),
+                        tooltip: None,
                     });
-
-                    if *expanded {
-                        y += set_h;
-                        let drawer_rect = [x, y, w, COLOR_DRAWER_H];
-                        draw.fill(drawer_rect, with_alpha(theme.setting_bg, 0xF5));
-                        draw.fill([x, y, 2.0, COLOR_DRAWER_H], theme.accent);
-
-                        let (a, r, g, b) = argb_parts(*value);
-                        let channels: [(&str, u8, u32); 4] = [
-                            ("R", r, 0xFFEF_5350),
-                            ("G", g, 0xFF4C_AF50),
-                            ("B", b, 0xFF42_A5F5),
-                            ("A", a, 0xFFB0_BEC5),
-                        ];
-                        for (ci, (cname, cval, bar_col)) in channels.iter().enumerate() {
-                            let cy = y + 2.0 + ci as f32 * 12.0;
-                            let track_x = inner_x + 12.0;
-                            let track_w = (inner_w - 14.0).max(24.0);
-                            let ch_rect = [inner_x, cy, inner_w, 11.0];
-                            draw.text(cname, [inner_x, cy + 1.5], theme.text_muted, false);
-                            draw.fill([track_x, cy + 1.0, track_w, 9.0], theme.slider_track);
-                            let frac = *cval as f32 / 255.0;
-                            draw.fill([track_x, cy + 1.0, track_w * frac, 9.0], *bar_col);
-                            let num_str = format!("{cval}");
-                            let nw = draw.text_width(&num_str);
-                            draw.text(
-                                &num_str,
-                                [track_x + track_w - nw - 2.0, cy + 1.5],
-                                0xFFFF_FFFF,
-                                false,
-                            );
-                            self.hits.push(HitItem {
-                                rect: ch_rect,
-                                clip,
-                                action: HitAction::SettingColorChannel {
-                                    mod_idx,
-                                    set_idx,
-                                    channel: ci as u8,
-                                    track_x,
-                                    track_w,
-                                },
-                                tooltip: Some("Drag to adjust color channel."),
-                            });
-                        }
-                        y += COLOR_DRAWER_H - set_h;
-                    }
                 }
             }
-
-            y += set_h;
+        }
+        if clipped {
+            let _ = draw.pop_clip();
         }
 
-        // Small bottom padding strip for the open settings drawer
-        draw.fill([x, y, w, 3.0], theme.setting_bg);
-        draw.fill([x, y + 2.0, w, 1.0], with_alpha(theme.border, 0x80));
-        let _ = drawer_start;
-        y + 3.0
+        if max_scroll > 0.5 {
+            let track_x = list_rect[0] + list_rect[2] - 3.5;
+            let thumb_h = ((list_rect[3] / content_h) * list_rect[3]).clamp(14.0, list_rect[3]);
+            let thumb_y = list_rect[1] + (scroll / max_scroll) * (list_rect[3] - thumb_h);
+            draw.fill([track_x, thumb_y, 2.5, thumb_h], with_alpha(theme.accent, 0xC8));
+        }
+
+        // Modal footer: count + Done button
+        let fy = my + mh - footer_bar_h;
+        let status = format!("{} selected", filter.len());
+        font.draw_body(
+            draw,
+            &status,
+            [mx + 10.0, font.center_y(fy, footer_bar_h)],
+            theme.text_muted,
+        );
+
+        let done_w = 48.0;
+        let done_h = 15.0;
+        let done_rect = [mx + mw - done_w - 8.0, fy + (footer_bar_h - done_h) * 0.5, done_w, done_h];
+        let done_hover = rect_contains(done_rect, mouse);
+        draw.fill(
+            done_rect,
+            if done_hover {
+                theme.accent
+            } else {
+                with_alpha(theme.accent, 0xC8)
+            },
+        );
+        let dw = font.width(draw, "Done", font.bold_headers);
+        font.draw_header(
+            draw,
+            "Done",
+            [
+                done_rect[0] + (done_w - dw) * 0.5,
+                font.center_y(done_rect[1], done_rect[3]),
+            ],
+            0xFFFF_FFFF,
+        );
+        self.hits.push(HitRegion {
+            rect: done_rect,
+            kind: HitKind::PickerClose,
+            tooltip: None,
+        });
+
+        draw_outline(draw, modal_rect, theme.accent);
     }
 
-    fn hovered_tooltip(&self, mouse: [f32; 2]) -> Option<&'static str> {
-        for item in self.hits.iter().rev() {
-            if item.contains(mouse)
-                && let Some(tip) = item.tooltip
-            {
-                return Some(tip);
-            }
-        }
-        None
+    fn render_footer(
+        &self,
+        draw: &mut dyn DrawContext,
+        size: [f32; 2],
+        theme: &Theme,
+        font: FontConfig,
+    ) {
+        let hint = if self.entity_picker.is_some() {
+            "Click entities to toggle  |  Scroll to browse  |  ESC Close Picker"
+        } else if self.listening_bind.is_some() {
+            "Press any key to bind  |  ESC or Backspace to clear"
+        } else if self.active_tab == GuiTab::Modules {
+            "LMB Toggle  |  RMB Settings / Reset  |  MMB Bind  |  Scroll Adjust  |  ESC Close"
+        } else {
+            "LMB Toggle / Drag Slider  |  RMB Reset Setting  |  Scroll to browse  |  ESC Close"
+        };
+        let hw = font.width(draw, hint, false);
+        let bar_w = hw + 18.0;
+        let x = (size[0] - bar_w) * 0.5;
+        let y = size[1] - FOOTER_H - 3.0;
+        draw.fill([x, y, bar_w, FOOTER_H], with_alpha(theme.panel_bg, 0xD2));
+        draw.fill([x, y, bar_w, 1.0], with_alpha(theme.accent, 0x70));
+        font.draw_body(
+            draw,
+            hint,
+            [x + 9.0, font.center_y(y, FOOTER_H)],
+            theme.text_muted,
+        );
     }
+
+    fn render_tooltip(
+        &self,
+        draw: &mut dyn DrawContext,
+        size: [f32; 2],
+        mouse: [f32; 2],
+        text: &str,
+        theme: &Theme,
+        font: FontConfig,
+    ) {
+        let tw = font.width(draw, text, false);
+        let w = tw + 12.0;
+        let h = (font.line_height() + 6.0).max(14.0);
+        let x = (mouse[0] + 10.0).min((size[0] - w - 4.0).max(4.0));
+        let y = (mouse[1] + 12.0).min((size[1] - h - FOOTER_H - 6.0).max(TOP_BAR_H + 4.0));
+        draw.fill([x, y, w, h], with_alpha(theme.header_bg, 0xF4));
+        draw.fill([x, y, 2.0, h], theme.accent);
+        draw_outline(draw, [x, y, w, h], theme.border);
+        font.draw_body(draw, text, [x + 6.0, font.center_y(y, h)], theme.text);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Input handlers
+    // ─────────────────────────────────────────────────────────────────────────
 
     pub fn mouse_pressed(
         &mut self,
@@ -838,76 +1714,123 @@ impl ClickGuiState {
         button: i32,
         manager: &mut ModuleManager,
     ) -> bool {
-        // Clicking anywhere while listening cancels keybind capture cleanly.
-        if self.listening.is_some() {
-            self.listening = None;
-            return true;
+        self.search_focused = false;
+        if let Some(p) = &mut self.entity_picker {
+            p.search_focused = false;
         }
 
-        let Some(action) = self
+        // Hit-test topmost element first
+        let hit = self
             .hits
             .iter()
             .rev()
-            .find(|h| h.contains(mouse))
-            .map(|h| h.action.clone())
-        else {
-            self.search_focused = false;
+            .find(|h| rect_contains(h.rect, mouse))
+            .cloned();
+
+        let Some(hit) = hit else {
+            self.listening_bind = None;
+            // Clicking outside the Entity Picker modal closes it cleanly.
+            if let Some(win) = self.picker_window_rect
+                && !rect_contains(win, mouse)
+            {
+                self.entity_picker = None;
+                return true;
+            }
             return false;
         };
 
-        self.search_focused = matches!(action, HitAction::SearchBox);
-
-        match action {
-            HitAction::SearchBox => {}
-            HitAction::ClearSearch => {
-                self.search.clear();
-            }
-            HitAction::ResetLayout => {
+        match hit.kind {
+            HitKind::Tab(tab) => {
                 if button == 0 {
-                    manager.reset_panel_layout(self.last_screen_size[0]);
+                    self.active_tab = tab;
+                    self.listening_bind = None;
+                    self.dragging = None;
                 }
+                true
             }
-            HitAction::PanelHeader(cat) => {
-                self.bring_to_front(cat);
+            HitKind::SearchBar => {
                 if button == 0 {
-                    let p = manager.panels[cat.index()];
-                    self.drag = Some(ActiveDrag::Panel {
-                        cat,
+                    self.search_focused = true;
+                } else if button == 1 {
+                    self.search.clear();
+                }
+                true
+            }
+            HitKind::SearchClear => {
+                self.search.clear();
+                self.search_focused = true;
+                true
+            }
+            HitKind::ResetLayout => {
+                if button == 0 {
+                    manager.reset_panel_layout(self.screen_size[0]);
+                }
+                true
+            }
+            HitKind::PanelHeader(category) => {
+                self.bring_to_front(category);
+                if button == 0 {
+                    let p = manager.panels[category.index()];
+                    self.dragging = Some(DragTarget::Panel {
+                        category,
                         offset_x: mouse[0] - p.x,
                         offset_y: mouse[1] - p.y,
                     });
                 } else if button == 1 {
-                    let p = &mut manager.panels[cat.index()];
+                    let p = &mut manager.panels[category.index()];
                     p.collapsed = !p.collapsed;
                     manager.dirty = true;
                 }
+                true
             }
-            HitAction::PanelBody(cat) => {
-                self.bring_to_front(cat);
+            HitKind::PanelCollapse(category) => {
+                self.bring_to_front(category);
+                let p = &mut manager.panels[category.index()];
+                p.collapsed = !p.collapsed;
+                manager.dirty = true;
+                true
             }
-            HitAction::ModuleRow(mod_idx) => {
-                let cat = manager.modules[mod_idx].category;
-                self.bring_to_front(cat);
-                let is_config_only = manager.modules[mod_idx].id == ModuleId::ClickGui;
+            HitKind::ToggleModuleEnabled(idx) => {
+                if button == 0 {
+                    let m = &mut manager.modules[idx];
+                    m.enabled = !m.enabled;
+                    manager.dirty = true;
+                }
+                true
+            }
+            HitKind::ModuleRow(idx) => {
+                let category = manager.modules[idx].category;
+                self.bring_to_front(category);
                 match button {
                     0 => {
-                        if is_config_only {
-                            manager.modules[mod_idx].expanded = !manager.modules[mod_idx].expanded;
+                        let m = &mut manager.modules[idx];
+                        if m.id == ModuleId::ClickGui {
+                            m.expanded = !m.expanded;
                         } else {
-                            manager.modules[mod_idx].enabled = !manager.modules[mod_idx].enabled;
+                            m.enabled = !m.enabled;
                             manager.dirty = true;
                         }
                     }
                     1 => {
-                        manager.modules[mod_idx].expanded = !manager.modules[mod_idx].expanded;
+                        manager.modules[idx].expanded = !manager.modules[idx].expanded;
                     }
-                    2 if !is_config_only => {
-                        self.listening = Some(KeybindTarget::Module(mod_idx));
+                    2 if manager.modules[idx].id != ModuleId::ClickGui => {
+                        self.listening_bind = Some(BindTarget::Module(idx));
                     }
                     _ => {}
                 }
+                true
             }
-            HitAction::SettingBool { mod_idx, set_idx } => {
+            HitKind::ModuleBind(idx) => {
+                if button == 0 {
+                    self.listening_bind = Some(BindTarget::Module(idx));
+                } else if button == 1 {
+                    manager.modules[idx].keybind = None;
+                    manager.dirty = true;
+                }
+                true
+            }
+            HitKind::SettingBool { mod_idx, set_idx } => {
                 let setting = &mut manager.modules[mod_idx].settings[set_idx];
                 if button == 0 {
                     if let SettingKind::Bool { value, .. } = &mut setting.kind {
@@ -917,30 +1840,28 @@ impl ClickGuiState {
                 } else if button == 1 && setting.reset() {
                     manager.dirty = true;
                 }
+                true
             }
-            HitAction::SettingSlider {
-                mod_idx,
-                set_idx,
-                track_x,
-                track_w,
-            } => {
-                let setting = &mut manager.modules[mod_idx].settings[set_idx];
+            HitKind::SettingSlider { mod_idx, set_idx } => {
                 if button == 0 {
-                    let frac = ((mouse[0] - track_x) / track_w.max(1.0)).clamp(0.0, 1.0);
-                    if setting.set_slider_fraction(frac) {
+                    let bar_x = hit.rect[0] + 5.0;
+                    let bar_w = (hit.rect[2] - 10.0).max(1.0);
+                    let frac = ((mouse[0] - bar_x) / bar_w).clamp(0.0, 1.0);
+                    if manager.modules[mod_idx].settings[set_idx].set_slider_fraction(frac) {
                         manager.dirty = true;
                     }
-                    self.drag = Some(ActiveDrag::Slider {
+                    self.dragging = Some(DragTarget::Slider {
                         mod_idx,
                         set_idx,
-                        track_x,
-                        track_w,
+                        x: bar_x,
+                        w: bar_w,
                     });
-                } else if button == 1 && setting.reset() {
+                } else if button == 1 && manager.modules[mod_idx].settings[set_idx].reset() {
                     manager.dirty = true;
                 }
+                true
             }
-            HitAction::SettingMode { mod_idx, set_idx } => {
+            HitKind::SettingMode { mod_idx, set_idx } => {
                 let setting = &mut manager.modules[mod_idx].settings[set_idx];
                 if let SettingKind::Mode { index, options, .. } = &mut setting.kind
                     && !options.is_empty()
@@ -949,25 +1870,28 @@ impl ClickGuiState {
                         *index = (*index + 1) % options.len();
                         manager.dirty = true;
                     } else if button == 1 {
-                        *index = if *index == 0 {
-                            options.len() - 1
-                        } else {
-                            *index - 1
-                        };
+                        *index = (*index + options.len() - 1) % options.len();
                         manager.dirty = true;
                     }
                 }
+                true
             }
-            HitAction::SettingKeybind { mod_idx, set_idx } => {
+            HitKind::SettingEntityFilter { mod_idx, set_idx } => {
                 if button == 0 {
-                    self.listening = Some(KeybindTarget::Setting { mod_idx, set_idx });
-                } else if button == 1
-                    && manager.modules[mod_idx].settings[set_idx].reset()
-                {
+                    self.entity_picker = Some(EntityPickerState {
+                        mod_idx,
+                        set_idx,
+                        search: String::new(),
+                        search_focused: false,
+                        scroll: 0.0,
+                        filter: PickerFilter::All,
+                    });
+                } else if button == 1 && manager.modules[mod_idx].settings[set_idx].reset() {
                     manager.dirty = true;
                 }
+                true
             }
-            HitAction::SettingColorHeader { mod_idx, set_idx } => {
+            HitKind::SettingColorHeader { mod_idx, set_idx } => {
                 let setting = &mut manager.modules[mod_idx].settings[set_idx];
                 if button == 0 {
                     if let SettingKind::Color { expanded, .. } = &mut setting.kind {
@@ -976,79 +1900,167 @@ impl ClickGuiState {
                 } else if button == 1 && setting.reset() {
                     manager.dirty = true;
                 }
+                true
             }
-            HitAction::SettingColorChannel {
+            HitKind::SettingColorChannel {
                 mod_idx,
                 set_idx,
                 channel,
-                track_x,
-                track_w,
             } => {
                 if button == 0 {
-                    update_color_channel(
-                        manager, mod_idx, set_idx, channel, mouse[0], track_x, track_w,
+                    let frac = ((mouse[0] - hit.rect[0]) / hit.rect[2].max(1.0)).clamp(0.0, 1.0);
+                    set_color_channel(
+                        &mut manager.modules[mod_idx].settings[set_idx],
+                        channel,
+                        frac,
                     );
-                    self.drag = Some(ActiveDrag::ColorChannel {
+                    manager.dirty = true;
+                    self.dragging = Some(DragTarget::ColorChannel {
                         mod_idx,
                         set_idx,
                         channel,
-                        track_x,
-                        track_w,
+                        x: hit.rect[0],
+                        w: hit.rect[2].max(1.0),
                     });
-                } else if button == 1
-                    && manager.modules[mod_idx].settings[set_idx].reset()
-                {
+                }
+                true
+            }
+            HitKind::SettingKeybind { mod_idx, set_idx } => {
+                if button == 0 {
+                    self.listening_bind = Some(BindTarget::Setting { mod_idx, set_idx });
+                } else if button == 1 && manager.modules[mod_idx].settings[set_idx].reset() {
                     manager.dirty = true;
                 }
+                true
+            }
+
+            // Entity Picker modal actions
+            HitKind::PickerClose => {
+                self.entity_picker = None;
+                true
+            }
+            HitKind::PickerSearchBar => {
+                if let Some(p) = &mut self.entity_picker {
+                    if button == 0 {
+                        p.search_focused = true;
+                    } else if button == 1 {
+                        p.search.clear();
+                        p.scroll = 0.0;
+                    }
+                }
+                true
+            }
+            HitKind::PickerSearchClear => {
+                if let Some(p) = &mut self.entity_picker {
+                    p.search.clear();
+                    p.search_focused = true;
+                    p.scroll = 0.0;
+                }
+                true
+            }
+            HitKind::PickerSelectAll => {
+                if let Some(p) = &self.entity_picker
+                    && let Some(ef) = manager.modules[p.mod_idx].settings[p.set_idx]
+                        .as_entity_filter_mut()
+                {
+                    ef.select_all();
+                    manager.dirty = true;
+                }
+                true
+            }
+            HitKind::PickerSelectNone => {
+                if let Some(p) = &self.entity_picker
+                    && let Some(ef) = manager.modules[p.mod_idx].settings[p.set_idx]
+                        .as_entity_filter_mut()
+                {
+                    ef.clear();
+                    manager.dirty = true;
+                }
+                true
+            }
+            HitKind::PickerToggleGroup(group) => {
+                if let Some(p) = &self.entity_picker
+                    && let Some(ef) = manager.modules[p.mod_idx].settings[p.set_idx]
+                        .as_entity_filter_mut()
+                {
+                    ef.toggle_group(group);
+                    manager.dirty = true;
+                }
+                true
+            }
+            HitKind::PickerFilterTab(flt) => {
+                if let Some(p) = &mut self.entity_picker {
+                    p.filter = flt;
+                    p.scroll = 0.0;
+                }
+                true
+            }
+            HitKind::PickerEntityToggle(entity_id) => {
+                if let Some(p) = &self.entity_picker
+                    && let Some(ef) = manager.modules[p.mod_idx].settings[p.set_idx]
+                        .as_entity_filter_mut()
+                {
+                    ef.toggle(&entity_id);
+                    manager.dirty = true;
+                }
+                true
             }
         }
-
-        true
     }
 
     pub fn mouse_dragged(&mut self, mouse: [f32; 2], manager: &mut ModuleManager) -> bool {
-        let Some(drag) = self.drag else {
+        let Some(drag) = self.dragging else {
             return false;
         };
         match drag {
-            ActiveDrag::Panel {
-                cat,
+            DragTarget::Panel {
+                category,
                 offset_x,
                 offset_y,
             } => {
-                let panel = &mut manager.panels[cat.index()];
-                panel.x = (mouse[0] - offset_x).max(2.0);
-                panel.y = (mouse[1] - offset_y).max(TOP_BAR_H + 4.0);
+                let panel_w = manager.get(ModuleId::ClickGui).int("panel_width", 154) as f32;
+                let p = &mut manager.panels[category.index()];
+                p.x = (mouse[0] - offset_x).clamp(4.0, (self.screen_size[0] - panel_w - 4.0).max(4.0));
+                p.y = (mouse[1] - offset_y).clamp(
+                    TOP_BAR_H + 4.0,
+                    (self.screen_size[1] - HEADER_H - FOOTER_H - 4.0).max(TOP_BAR_H + 4.0),
+                );
                 manager.dirty = true;
+                true
             }
-            ActiveDrag::Slider {
+            DragTarget::Slider {
                 mod_idx,
                 set_idx,
-                track_x,
-                track_w,
+                x,
+                w,
             } => {
-                let frac = ((mouse[0] - track_x) / track_w.max(1.0)).clamp(0.0, 1.0);
+                let frac = ((mouse[0] - x) / w.max(1.0)).clamp(0.0, 1.0);
                 if manager.modules[mod_idx].settings[set_idx].set_slider_fraction(frac) {
                     manager.dirty = true;
                 }
+                true
             }
-            ActiveDrag::ColorChannel {
+            DragTarget::ColorChannel {
                 mod_idx,
                 set_idx,
                 channel,
-                track_x,
-                track_w,
+                x,
+                w,
             } => {
-                update_color_channel(
-                    manager, mod_idx, set_idx, channel, mouse[0], track_x, track_w,
+                let frac = ((mouse[0] - x) / w.max(1.0)).clamp(0.0, 1.0);
+                set_color_channel(
+                    &mut manager.modules[mod_idx].settings[set_idx],
+                    channel,
+                    frac,
                 );
+                manager.dirty = true;
+                true
             }
         }
-        true
     }
 
     pub fn mouse_released(&mut self) -> bool {
-        self.drag.take().is_some()
+        self.dragging.take().is_some()
     }
 
     pub fn mouse_scrolled(
@@ -1061,160 +2073,208 @@ impl ClickGuiState {
         if scroll_y.abs() < 1e-4 {
             return false;
         }
-        let dir = if scroll_y > 0.0 { 1 } else { -1 };
 
-        // First check if hovering directly over a slider to fine-adjust it.
-        for item in self.hits.iter().rev() {
-            if !item.contains(mouse) {
-                continue;
+        // Scroll inside Entity Picker list when open
+        if let Some((rect, max_scroll)) = self.picker_list_rect
+            && let Some(p) = &mut self.entity_picker
+        {
+            if rect_contains(rect, mouse) && max_scroll > 0.5 {
+                p.scroll = (p.scroll - scroll_y as f32 * 18.0).clamp(0.0, max_scroll);
             }
-            match item.action {
-                HitAction::SettingSlider {
-                    mod_idx, set_idx, ..
-                } => {
-                    let mult = if modifiers & 1 != 0 { 5 } else { 1 };
-                    if manager.modules[mod_idx].settings[set_idx].nudge(dir * mult) {
+            return true;
+        }
+
+        // Fine-adjust slider when hovering directly over one
+        if let Some(hit) = self
+            .hits
+            .iter()
+            .rev()
+            .find(|h| rect_contains(h.rect, mouse))
+            && let HitKind::SettingSlider { mod_idx, set_idx } = hit.kind
+        {
+            let mult = if (modifiers & 1) != 0 { 5 } else { 1 };
+            let dir = if scroll_y > 0.0 { 1 } else { -1 };
+            if manager.modules[mod_idx].settings[set_idx].nudge(dir * mult) {
+                manager.dirty = true;
+                return true;
+            }
+        }
+
+        // Scroll Settings / HUD card
+        if let Some((rect, max_scroll)) = self.card_scroll_rect
+            && rect_contains(rect, mouse)
+            && max_scroll > 0.5
+        {
+            let s = if self.active_tab == GuiTab::Settings {
+                &mut self.settings_scroll
+            } else {
+                &mut self.hud_scroll
+            };
+            *s = (*s - scroll_y as f32 * 18.0).clamp(0.0, max_scroll);
+            return true;
+        }
+
+        // Scroll whichever category panel is under the cursor
+        for &(category, rect, max_scroll) in self.panel_rects.iter().rev() {
+            if rect_contains(rect, mouse) && max_scroll > 0.5 {
+                let p = &mut manager.panels[category.index()];
+                p.scroll = (p.scroll - scroll_y as f32 * 18.0).clamp(0.0, max_scroll);
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn key_pressed(&mut self, key: &str, manager: &mut ModuleManager) -> bool {
+        // Keybind capture has highest priority
+        if let Some(target) = self.listening_bind.take() {
+            let cleared = matches!(
+                key,
+                "key.keyboard.escape" | "key.keyboard.backspace" | "key.keyboard.delete"
+            );
+            let value = if cleared { None } else { Some(key.to_owned()) };
+            match target {
+                BindTarget::Module(idx) => {
+                    manager.modules[idx].keybind = value;
+                    manager.dirty = true;
+                }
+                BindTarget::Setting { mod_idx, set_idx } => {
+                    if let SettingKind::Keybind { key: slot, .. } =
+                        &mut manager.modules[mod_idx].settings[set_idx].kind
+                    {
+                        *slot = value;
                         manager.dirty = true;
                     }
+                }
+            }
+            return true;
+        }
+
+        // Entity Picker modal keyboard handling
+        if let Some(p) = &mut self.entity_picker {
+            if key == "key.keyboard.escape" {
+                self.entity_picker = None;
+                return true;
+            }
+            if p.search_focused {
+                if key == "key.keyboard.backspace" {
+                    p.search.pop();
+                    p.scroll = 0.0;
                     return true;
                 }
-                HitAction::PanelBody(cat) => {
-                    let p = &mut manager.panels[cat.index()];
-                    p.scroll = (p.scroll - (scroll_y as f32) * 18.0).max(0.0);
+                if key == "key.keyboard.enter" {
+                    p.search_focused = false;
+                    return true;
+                }
+            }
+            return true;
+        }
+
+        if self.search_focused {
+            match key {
+                "key.keyboard.escape" | "key.keyboard.enter" => {
+                    self.search_focused = false;
+                    return true;
+                }
+                "key.keyboard.backspace" => {
+                    self.search.pop();
                     return true;
                 }
                 _ => {}
             }
         }
-        false
-    }
 
-    /// Handles a key press while the ClickGUI screen is open.
-    /// Returns `true` if the press was consumed (preventing Escape-close).
-    pub fn key_pressed(&mut self, key: &str, manager: &mut ModuleManager) -> bool {
-        if let Some(target) = self.listening.take() {
-            let clear = matches!(
-                key,
-                "key.keyboard.escape" | "key.keyboard.backspace" | "key.keyboard.delete"
-            );
-            let new_key = if clear { None } else { Some(key.to_owned()) };
-            match target {
-                KeybindTarget::Module(mod_idx) => {
-                    manager.modules[mod_idx].keybind = new_key;
-                    manager.dirty = true;
-                }
-                KeybindTarget::Setting { mod_idx, set_idx } => {
-                    if let SettingKind::Keybind { key: slot, .. } =
-                        &mut manager.modules[mod_idx].settings[set_idx].kind
-                    {
-                        *slot = new_key;
-                        manager.dirty = true;
-                    }
-                }
-            }
-            return true;
-        }
-
-        if key == "key.keyboard.backspace" && !self.search.is_empty() {
-            self.search.pop();
-            return true;
-        }
-
-        if key == "key.keyboard.escape" && !self.search.is_empty() {
-            self.search.clear();
-            self.search_focused = false;
-            return true;
-        }
-
-        // Let Escape close the mod screen cleanly.
         false
     }
 
     pub fn char_typed(&mut self, c: char) -> bool {
-        if self.listening.is_some() {
+        if self.listening_bind.is_some() {
             return true;
         }
-        if !c.is_control() && self.search.len() < 40 {
+        if let Some(p) = &mut self.entity_picker {
+            if !c.is_control() && p.search.len() < 32 {
+                p.search_focused = true;
+                p.search.push(c);
+                p.scroll = 0.0;
+                return true;
+            }
+            return false;
+        }
+        if self.search_focused && !c.is_control() && self.search.len() < 32 {
             self.search.push(c);
-            self.search_focused = true;
             return true;
         }
         false
     }
-}
 
-fn update_color_channel(
-    manager: &mut ModuleManager,
-    mod_idx: usize,
-    set_idx: usize,
-    channel: u8,
-    mouse_x: f32,
-    track_x: f32,
-    track_w: f32,
-) {
-    let frac = ((mouse_x - track_x) / track_w.max(1.0)).clamp(0.0, 1.0);
-    let val = (frac * 255.0).round().clamp(0.0, 255.0) as u8;
-    if let SettingKind::Color { value, .. } = &mut manager.modules[mod_idx].settings[set_idx].kind {
-        let (mut a, mut r, mut g, mut b) = argb_parts(*value);
-        match channel {
-            0 => r = val,
-            1 => g = val,
-            2 => b = val,
-            _ => a = val,
-        }
-        let next = pack_argb(a, r, g, b);
-        if next != *value {
-            *value = next;
-            manager.dirty = true;
+    fn bring_to_front(&mut self, category: Category) {
+        if let Some(pos) = self.panel_order.iter().position(|&c| c == category) {
+            let item = self.panel_order.remove(pos);
+            self.panel_order.push(item);
         }
     }
-    // Automatically switch theme preset to Custom when editing a ClickGUI custom color.
-    if manager.modules[mod_idx].id == ModuleId::ClickGui
-        && let Some(preset) = manager.modules[mod_idx].setting_mut("preset")
-        && let SettingKind::Mode { index, options, .. } = &mut preset.kind
-    {
-        *index = options.len().saturating_sub(1);
+}
+
+fn module_drawer_height(m: &crate::module::Module, include_module_bind: bool) -> f32 {
+    let mut h = if include_module_bind && m.id != ModuleId::ClickGui {
+        SETTING_H
+    } else {
+        0.0
+    };
+    let mut last_group: Option<&str> = None;
+    for s in &m.settings {
+        if let Some(grp) = s.group
+            && last_group != Some(grp)
+        {
+            last_group = Some(grp);
+            h += GROUP_H;
+        }
+        h += SETTING_H;
+        if let SettingKind::Color { expanded: true, .. } = s.kind {
+            h += COLOR_DRAWER_H;
+        }
+    }
+    h + 2.0
+}
+
+fn set_color_channel(setting: &mut crate::settings::Setting, channel: u8, frac: f32) {
+    let byte = (frac.clamp(0.0, 1.0) * 255.0).round() as u32;
+    if let SettingKind::Color { value, .. } = &mut setting.kind {
+        *value = match channel {
+            0 => (*value & 0xFF00_FFFF) | (byte << 16), // R
+            1 => (*value & 0xFFFF_00FF) | (byte << 8),  // G
+            2 => (*value & 0xFFFF_FF00) | byte,         // B
+            _ => (*value & 0x00FF_FFFF) | (byte << 24), // A
+        };
     }
 }
 
-fn draw_tooltip(
-    draw: &mut dyn DrawContext,
-    size: [f32; 2],
-    mouse: [f32; 2],
-    text: &str,
-    theme: &Theme,
-) {
-    let tw = draw.text_width(text);
-    let pad = 5.0;
-    let w = tw + pad * 2.0;
-    let h = 15.0;
-    let mut x = mouse[0] + 10.0;
-    let mut y = mouse[1] + 12.0;
-    if x + w > size[0] - 4.0 {
-        x = (size[0] - w - 4.0).max(4.0);
+fn draw_outline(draw: &mut dyn DrawContext, rect: [f32; 4], argb: u32) {
+    let [x, y, w, h] = rect;
+    let t = 1.0;
+    draw.fill([x, y, w, t], argb);
+    draw.fill([x, y + h - t, w, t], argb);
+    draw.fill([x, y, t, h], argb);
+    draw.fill([x + w - t, y, t, h], argb);
+}
+
+fn rect_contains(rect: [f32; 4], point: [f32; 2]) -> bool {
+    point[0] >= rect[0]
+        && point[0] <= rect[0] + rect[2]
+        && point[1] >= rect[1]
+        && point[1] <= rect[1] + rect[3]
+}
+
+fn intersect_rects(a: [f32; 4], b: [f32; 4]) -> Option<[f32; 4]> {
+    let x0 = a[0].max(b[0]);
+    let y0 = a[1].max(b[1]);
+    let x1 = (a[0] + a[2]).min(b[0] + b[2]);
+    let y1 = (a[1] + a[3]).min(b[1] + b[3]);
+    if x1 > x0 && y1 > y0 {
+        Some([x0, y0, x1 - x0, y1 - y0])
+    } else {
+        None
     }
-    if y + h > size[1] - 18.0 {
-        y = (mouse[1] - h - 6.0).max(TOP_BAR_H + 4.0);
-    }
-    let rect = [x, y, w, h];
-    draw_bordered_rect(draw, rect, with_alpha(theme.header_bg, 0xF5), theme.accent);
-    draw.text(text, [x + pad, y + 3.5], theme.text, false);
-}
-
-fn draw_bordered_rect(draw: &mut dyn DrawContext, rect: [f32; 4], bg: u32, border: u32) {
-    draw.fill(rect, bg);
-    draw_outline(draw, rect, border);
-}
-
-fn draw_outline(draw: &mut dyn DrawContext, [x, y, w, h]: [f32; 4], color: u32) {
-    draw.fill([x, y, w, 1.0], color);
-    draw.fill([x, y + h - 1.0, w, 1.0], color);
-    draw.fill([x, y, 1.0, h], color);
-    draw.fill([x + w - 1.0, y, 1.0, h], color);
-}
-
-fn rect_contains([x, y, w, h]: [f32; 4], [px, py]: [f32; 2]) -> bool {
-    px >= x && px <= x + w && py >= y && py <= y + h
 }
 
 #[cfg(test)]
@@ -1224,30 +2284,41 @@ mod tests {
     #[test]
     fn search_and_keybind_listening_work() {
         let mut mgr = ModuleManager::new();
-        let mut gui = ClickGuiState::default();
-
+        let mut gui = ClickGuiState {
+            search_focused: true,
+            ..Default::default()
+        };
         assert!(gui.char_typed('a'));
         assert!(gui.char_typed('i'));
-        assert!(gui.char_typed('m'));
-        assert_eq!(gui.search, "aim");
-        assert_eq!(mgr.indices_in_category(Category::Combat, &gui.search).len(), 1);
-        assert_eq!(mgr.indices_in_category(Category::Player, &gui.search).len(), 0);
+        assert_eq!(gui.search, "ai");
+        assert!(gui.key_pressed("key.keyboard.backspace", &mut mgr));
+        assert_eq!(gui.search, "a");
 
-        // Escape clears non-empty search without closing screen.
-        assert!(gui.key_pressed("key.keyboard.escape", &mut mgr));
-        assert!(gui.search.is_empty());
-        // Second Escape lets the game close the screen.
-        assert!(!gui.key_pressed("key.keyboard.escape", &mut mgr));
-
-        // Simulate middle-click keybind capture on Aim Assist (index 0).
-        gui.listening = Some(KeybindTarget::Module(0));
-        assert!(gui.key_pressed("key.keyboard.r", &mut mgr));
-        assert_eq!(mgr.get(ModuleId::AimAssist).keybind.as_deref(), Some("key.keyboard.r"));
+        gui.listening_bind = Some(BindTarget::Module(0));
+        assert!(gui.is_listening());
+        assert!(gui.key_pressed("key.keyboard.v", &mut mgr));
         assert!(!gui.is_listening());
+        assert_eq!(mgr.modules[0].keybind.as_deref(), Some("key.keyboard.v"));
+    }
 
-        // Triggering the hotkey toggles the module.
-        assert!(!mgr.is_enabled(ModuleId::AimAssist));
-        assert_eq!(mgr.trigger_keybind("key.keyboard.r"), 1);
-        assert!(mgr.is_enabled(ModuleId::AimAssist));
+    #[test]
+    fn entity_picker_search_and_escape_work() {
+        let mut mgr = ModuleManager::new();
+        let mut gui = ClickGuiState {
+            entity_picker: Some(EntityPickerState {
+                mod_idx: 0,
+                set_idx: 0,
+                search: String::new(),
+                search_focused: true,
+                scroll: 0.0,
+                filter: PickerFilter::All,
+            }),
+            ..Default::default()
+        };
+        assert!(gui.char_typed('z'));
+        assert!(gui.char_typed('o'));
+        assert_eq!(gui.entity_picker.as_ref().unwrap().search, "zo");
+        assert!(gui.key_pressed("key.keyboard.escape", &mut mgr));
+        assert!(gui.entity_picker.is_none());
     }
 }
