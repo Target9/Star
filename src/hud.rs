@@ -13,6 +13,7 @@ pub fn render(
     host: &dyn ClientHost,
     draw: &mut dyn DrawContext,
     manager: &ModuleManager,
+    interp: &visuals::EntityInterpCache,
     target: Option<&AimTargetInfo>,
 ) {
     let hud = manager.get(ModuleId::Hud);
@@ -23,7 +24,7 @@ pub fn render(
     let bg_alpha = ((hud.float("bg_opacity", 0.60) * 255.0).round() as u32).clamp(0, 245) as u8;
 
     // 2D ESP boxes, health bars, and floating Nametags draw underneath HUD chrome.
-    visuals::render_screen_overlays(host, draw, manager, &theme, font);
+    visuals::render_screen_overlays(host, draw, manager, interp, &theme, font);
 
     if hud.enabled {
         if hud.bool("watermark", true) {

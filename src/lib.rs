@@ -1,6 +1,6 @@
 //! Star — Meteor-inspired modular client for Horizon (Minecraft 26.3 in Rust).
 //!
-//! Press Right Shift (customizable in Controls or the Settings tab) while in a world
+//! Press Right Shift (customizable in the Settings tab) while in a world
 //! to open the ClickGUI.
 
 mod config;
@@ -17,13 +17,13 @@ mod theme;
 use std::sync::{Mutex, OnceLock};
 
 use mod_api::{
-    self, CameraDistanceEvent, CameraShakeEvent, ClientHost, ClientTickPreEvent, Flow, HostSide,
-    InputKeyEvent, KeyAction, KeyConflictContext, KeyRegistration, PlayerBreakSpeedEvent,
+    self, CameraDistanceEvent, CameraShakeEvent, ClientHost, ClientTickPreEvent,
+    EntityOutlineEvent, Flow, HostSide, InputKeyEvent, KeyAction, PlayerBreakSpeedEvent,
     Registrar, RegistrationContext, RenderFogEvent, RenderFramePreEvent, RenderGuiPostEvent,
-    RenderNameTagEvent, ScreenCharTypedPreEvent, ScreenClosingEvent, ScreenKeyPressedPreEvent,
-    ScreenMouseButtonPressedPreEvent, ScreenMouseButtonReleasedPreEvent,
-    ScreenMouseDraggedPreEvent, ScreenMouseScrolledPreEvent, ScreenRenderPostEvent, SettingSpec,
-    SubmitCustomGeometryEvent, Zoom, ZoomEvent,
+    RenderLivingPostEvent, RenderNameTagEvent, RenderPlayerPreEvent, ScreenCharTypedPreEvent,
+    ScreenClosingEvent, ScreenKeyPressedPreEvent, ScreenMouseButtonPressedPreEvent,
+    ScreenMouseButtonReleasedPreEvent, ScreenMouseDraggedPreEvent, ScreenMouseScrolledPreEvent,
+    ScreenRenderPostEvent, SettingSpec, SubmitCustomGeometryEvent, Zoom, ZoomEvent,
 };
 
 use crate::gui::ClickGuiState;
@@ -32,12 +32,13 @@ use crate::modules::aim_assist::{self, AimTargetInfo};
 use crate::modules::{fast_mine, visuals};
 
 const MOD_ID: &str = "star";
-const OPEN_GUI_KEY_ID: &str = "open_gui";
+const DEFAULT_GUI_KEY: &str = "key.keyboard.right.shift";
 
 struct ClientState {
     manager: ModuleManager,
     gui: ClickGuiState,
     aim_target: Option<AimTargetInfo>,
+    interp: visuals::EntityInterpCache,
 }
 
 impl ClientState {
@@ -46,6 +47,7 @@ impl ClientState {
             manager: ModuleManager::new(),
             gui: ClickGuiState::default(),
             aim_target: None,
+            interp: visuals::EntityInterpCache::default(),
         }
     }
 }
@@ -76,15 +78,13 @@ impl mod_api::Hooks for Mod {
             entity_filter::init_catalog(&entity_types);
         }
 
+        // Use plain literal labels and do not register global key mappings or lang
+        // files: Star keeps all keybinds private in config/star.cfg so servers
+        // cannot probe translation keys or keybind components on join.
         let _ = registrar.register_setting(
-            SettingSpec::toggle("enabled", "star.setting.enabled", true)
-                .tooltip("star.setting.enabled.tip"),
-        );
-        registrar.register_key_mapping(
-            KeyRegistration::new(OPEN_GUI_KEY_ID, "key.keyboard.right.shift")
-                .label("star.key.open_gui")
-                .category("star.category.keys")
-                .context(KeyConflictContext::Universal),
+            SettingSpec::toggle("enabled", "Enable Star", true).tooltip(
+                "Master switch for all modules and overlays. Press Right Shift in-game to open the ClickGUI.",
+            ),
         );
     }
 
@@ -92,8 +92,6 @@ impl mod_api::Hooks for Mod {
         if !mod_active(host) || event.action != KeyAction::Press {
             return;
         }
-
-        let controls_key = host.mod_key(MOD_ID, OPEN_GUI_KEY_ID).map(|(k, _)| k);
 
         enum Action {
             None,
@@ -111,12 +109,8 @@ impl mod_api::Hooks for Mod {
             if own_screen && st.gui.is_listening() {
                 Action::None
             } else {
-                let configured_key = st
-                    .manager
-                    .gui_key()
-                    .map(str::to_owned)
-                    .or(controls_key);
-                let is_gui_key = configured_key.as_deref() == Some(event.key);
+                let configured_key = st.manager.gui_key().unwrap_or(DEFAULT_GUI_KEY);
+                let is_gui_key = configured_key == event.key;
 
                 if is_gui_key {
                     if own_screen {
@@ -149,14 +143,20 @@ impl mod_api::Hooks for Mod {
 
     fn client_tick_pre(&self, host: &mut dyn ClientHost, _: &mut ClientTickPreEvent) {
         if !mod_active(host) {
-            lock_state().aim_target = None;
+            let mut st = lock_state();
+            st.aim_target = None;
+            st.interp.clear();
             return;
         }
 
-        let (aim_module, should_load, should_save) = {
+        let (aim_module, need_interp, should_load, should_save) = {
             let st = lock_state();
+            let need_interp = st.manager.is_enabled(ModuleId::Esp)
+                || st.manager.is_enabled(ModuleId::Tracers)
+                || st.manager.is_enabled(ModuleId::Nametags);
             (
                 st.manager.get(ModuleId::AimAssist).clone(),
+                need_interp,
                 !st.manager.config_loaded,
                 st.manager.dirty,
             )
@@ -169,6 +169,9 @@ impl mod_api::Hooks for Mod {
             let mut st = lock_state();
             config::save(host, &mut st.manager);
         }
+
+        // Snapshot entity boxes once per tick before Horizon advances positions for smooth 3D/2D lerp.
+        lock_state().interp.on_tick_pre(host, need_interp);
 
         if aim_module.enabled && aim_module.mode("update_rate", 0) == 1 {
             let target = aim_assist::step(host, &aim_module, 1.0, false);
@@ -183,7 +186,11 @@ impl mod_api::Hooks for Mod {
             return;
         }
 
-        let aim_module = lock_state().manager.get(ModuleId::AimAssist).clone();
+        let aim_module = {
+            let mut st = lock_state();
+            st.interp.last_partial_tick = event.world_partial_tick;
+            st.manager.get(ModuleId::AimAssist).clone()
+        };
         if aim_module.enabled && aim_module.mode("update_rate", 0) == 0 {
             let tick_scale = (event.elapsed.as_secs_f32() * 20.0).clamp(0.02, 2.0);
             let target = aim_assist::step(host, &aim_module, tick_scale, true);
@@ -200,7 +207,35 @@ impl mod_api::Hooks for Mod {
             return;
         }
         let st = lock_state();
-        visuals::render_world_geometry(host, event.view, event.draw, &st.manager);
+        visuals::render_world_geometry(host, event.view, event.draw, &st.manager, &st.interp);
+    }
+
+    fn render_player_pre(
+        &self,
+        host: &dyn ClientHost,
+        event: &mut RenderPlayerPreEvent<'_>,
+    ) -> Flow {
+        if mod_active(host) {
+            let st = lock_state();
+            visuals::apply_skin_player_pre(host, &st.manager, event);
+        }
+        Flow::Continue
+    }
+
+    fn render_living_post(&self, host: &dyn ClientHost, event: &mut RenderLivingPostEvent<'_>) {
+        if !mod_active(host) {
+            return;
+        }
+        let st = lock_state();
+        visuals::apply_skin_living_post(host, &st.manager, event);
+    }
+
+    fn entity_outline(&self, host: &dyn ClientHost, event: &mut EntityOutlineEvent<'_>) {
+        if !mod_active(host) {
+            return;
+        }
+        let st = lock_state();
+        visuals::apply_skin_outline(host, &st.manager, event);
     }
 
     fn render_fog(&self, host: &dyn ClientHost, event: &mut RenderFogEvent<'_>) {
@@ -258,7 +293,13 @@ impl mod_api::Hooks for Mod {
             return;
         }
         let st = lock_state();
-        hud::render(host, event.draw, &st.manager, st.aim_target.as_ref());
+        hud::render(
+            host,
+            event.draw,
+            &st.manager,
+            &st.interp,
+            st.aim_target.as_ref(),
+        );
     }
 
     fn screen_render_post(&self, host: &dyn ClientHost, event: &mut ScreenRenderPostEvent<'_>) {

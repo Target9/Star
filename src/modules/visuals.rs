@@ -1,8 +1,13 @@
-//! Render / Visual modules: ESP, Tracers, Nametags, No Fog, Zoom, and Camera.
+//! Render / Visual modules: ESP (3D/2D/Skin), Tracers, Nametags, No Fog, Zoom, and Camera.
+
+use std::collections::HashMap;
 
 use mod_api::{
-    CameraDistanceEvent, CameraShakeEvent, ClientHost, DrawContext, EntityRef, RenderFogEvent,
-    RenderNameTagEvent, WorldDepth, WorldDrawContext, WorldLine, WorldQuad, WorldRenderView, Zoom,
+    CameraDistanceEvent, CameraShakeEvent, ClientHost, CubeDeformation, CubeListBuilder,
+    DrawContext, EntityOutlineEvent, EntityRef, HumanoidPart, LayerDefinition, MeshDefinition,
+    ModelPart, PartPose, RenderFogEvent, RenderLivingPostEvent, RenderNameTagEvent,
+    RenderPlayerPreEvent, WorldDepth, WorldDrawContext, WorldLine, WorldQuad, WorldRenderView,
+    Zoom,
 };
 
 use crate::entity_filter::{EntityFilter, classify_entity_id, pretty_entity_id};
@@ -10,6 +15,121 @@ use crate::font::FontConfig;
 use crate::module::{Category, Module, ModuleId, ModuleManager};
 use crate::settings::Setting;
 use crate::theme::{Theme, with_alpha};
+
+const SKIN_TEXTURE: &str = "star:entity/white";
+const SKIN_TEXTURE_FALLBACK: &str = "block/white_concrete";
+const FULLBRIGHT_LIGHT: u32 = 0xF0F0;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Smooth tick-to-tick entity interpolation cache (eliminates 3D/2D box bounce)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Default)]
+pub struct EntityInterpCache {
+    prev_boxes: HashMap<u32, [[f64; 3]; 2]>,
+    prev_eyes: HashMap<u32, [f64; 3]>,
+    pub last_partial_tick: f32,
+}
+
+impl EntityInterpCache {
+    /// Captures nearby entity bounding boxes once per client tick (`client_tick_pre`),
+    /// right before Horizon advances entity positions for the new tick.
+    pub fn on_tick_pre(&mut self, host: &dyn ClientHost, needed: bool) {
+        if !needed || !host.playing() {
+            if !self.prev_boxes.is_empty() {
+                self.prev_boxes.clear();
+                self.prev_eyes.clear();
+            }
+            return;
+        }
+        let Some(player) = host.camera_entity() else {
+            return;
+        };
+        let Some(center) = player.position(host) else {
+            return;
+        };
+        let Some(level) = player.level(host) else {
+            return;
+        };
+        let pad = 136.0;
+        let Some(entities) = level.entities_in(
+            host,
+            [center[0] - pad, center[1] - pad, center[2] - pad],
+            [center[0] + pad, center[1] + pad, center[2] + pad],
+        ) else {
+            return;
+        };
+
+        let mut next_boxes = HashMap::with_capacity(entities.len());
+        let mut next_eyes = HashMap::with_capacity(entities.len());
+        for entity in entities {
+            let id = entity.id();
+            if let Some(bb) = entity.bounding_box(host) {
+                next_boxes.insert(id, bb);
+            }
+            if let Some(eye) = entity.eye_position(host) {
+                next_eyes.insert(id, eye);
+            }
+        }
+        self.prev_boxes = next_boxes;
+        self.prev_eyes = next_eyes;
+    }
+
+    pub fn clear(&mut self) {
+        self.prev_boxes.clear();
+        self.prev_eyes.clear();
+    }
+
+    /// Interpolates between the entity's previous-tick bounding box and current-tick
+    /// bounding box using `partial_tick` (matching Minecraft's `Mth.lerp` entity render).
+    /// Standing entities have `prev == curr`, giving zero vertical bounce.
+    pub fn interpolate_box(
+        &self,
+        entity_id: u32,
+        curr: [[f64; 3]; 2],
+        partial_tick: f32,
+    ) -> [[f64; 3]; 2] {
+        let Some(&prev) = self.prev_boxes.get(&entity_id) else {
+            return curr;
+        };
+        let pt = (partial_tick as f64).clamp(0.0, 1.0);
+        // Snap immediately on teleports / respawns rather than stretching across the world.
+        for i in 0..3 {
+            if (curr[0][i] - prev[0][i]).abs() > 4.0 || (curr[1][i] - prev[1][i]).abs() > 4.0 {
+                return curr;
+            }
+        }
+        let mut lo = curr[0];
+        let mut hi = curr[1];
+        for i in 0..3 {
+            lo[i] = prev[0][i] + (curr[0][i] - prev[0][i]) * pt;
+            hi[i] = prev[1][i] + (curr[1][i] - prev[1][i]) * pt;
+        }
+        [lo, hi]
+    }
+
+    pub fn interpolate_eye(
+        &self,
+        entity_id: u32,
+        curr: [f64; 3],
+        partial_tick: f32,
+    ) -> [f64; 3] {
+        let Some(&prev) = self.prev_eyes.get(&entity_id) else {
+            return curr;
+        };
+        let pt = (partial_tick as f64).clamp(0.0, 1.0);
+        for i in 0..3 {
+            if (curr[i] - prev[i]).abs() > 4.0 {
+                return curr;
+            }
+        }
+        [
+            prev[0] + (curr[0] - prev[0]) * pt,
+            prev[1] + (curr[1] - prev[1]) * pt,
+            prev[2] + (curr[2] - prev[2]) * pt,
+        ]
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Module definitions
@@ -20,7 +140,7 @@ pub fn build_esp_module() -> Module {
         id: ModuleId::Esp,
         key: "esp",
         name: "ESP",
-        description: "Highlights selected entities with 3D/2D boxes and health bars through walls.",
+        description: "Highlights selected entities with 3D/2D boxes, full colored Skin chams, and health bars.",
         category: Category::Render,
         enabled: false,
         keybind: None,
@@ -43,7 +163,7 @@ pub fn build_esp_module() -> Module {
             Setting::float(
                 "range",
                 "Range",
-                "Maximum distance in blocks to render ESP boxes.",
+                "Maximum distance in blocks to render ESP.",
                 8.0,
                 128.0,
                 2.0,
@@ -53,15 +173,15 @@ pub fn build_esp_module() -> Module {
             Setting::mode(
                 "style",
                 "Style",
-                "3D world-space boxes or crisp 2D screen-space overlays.",
-                &["3D Box", "3D Fill + Box", "2D Box", "2D Corners"],
+                "3D boxes, 2D overlays, or full colored Skin highlight.",
+                &["3D Box", "3D Fill + Box", "2D Box", "2D Corners", "Skin"],
                 1,
             )
             .group("Appearance"),
             Setting::bool(
                 "through_walls",
                 "Through Walls",
-                "Draw 3D ESP boxes visible through solid terrain.",
+                "Show 3D boxes and Skin glow outlines through solid terrain.",
                 true,
             ),
             Setting::float(
@@ -100,7 +220,7 @@ pub fn build_esp_module() -> Module {
             Setting::color(
                 "custom_color",
                 "Custom Color",
-                "Box color used when Color Mode is set to Custom.",
+                "Highlight color used when Color Mode is set to Custom.",
                 0xFF91_3DE8,
             ),
         ],
@@ -353,6 +473,213 @@ pub fn build_camera_module() -> Module {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Full-Body Skin ESP (`Style == "Skin"`, index 4)
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn is_skin_esp_active(manager: &ModuleManager) -> bool {
+    let esp = manager.get(ModuleId::Esp);
+    esp.enabled && esp.mode("style", 1) == 4
+}
+
+fn resolve_skin_color(
+    host: &dyn ClientHost,
+    manager: &ModuleManager,
+    entity_id: u32,
+    kind_id: &str,
+) -> Option<u32> {
+    if !host.playing() || !is_skin_esp_active(manager) {
+        return None;
+    }
+    let esp = manager.get(ModuleId::Esp);
+    if !esp.entity_filter("entities").is_some_and(|f| f.contains(kind_id)) {
+        return None;
+    }
+    if host.camera_entity().is_some_and(|c| c.id() == entity_id) {
+        return None;
+    }
+
+    let esp_range = esp.float("range", 64.0);
+    let mut distance = 0.0;
+    if let Some(entity) = host.entity(entity_id) {
+        if entity.spectator(host) == Some(true) {
+            return None;
+        }
+        if esp.bool("ignore_invisible", false) && entity.is_invisible(host) == Some(true) {
+            return None;
+        }
+        if let (Some(cam), Some(pos)) = (
+            host.camera_entity().and_then(|c| c.position(host)),
+            entity.position(host),
+        ) {
+            distance = dist3(cam, pos);
+            if distance > esp_range {
+                return None;
+            }
+        }
+    }
+
+    let theme = Theme::from_manager(manager, host.millis());
+    let color = entity_color(
+        kind_id,
+        distance,
+        esp_range,
+        esp.mode("color_mode", 0),
+        esp.color("custom_color", theme.accent),
+        theme.accent,
+    );
+    Some(color & 0x00FF_FFFF)
+}
+
+/// Builds a humanoid shell `ModelPart` matching vanilla `PlayerModel` / `HumanoidModel`
+/// dimensions, inflated slightly so every limb sits cleanly over the underlying skin.
+fn build_humanoid_skin_model(head_grow: f32, body_grow: f32) -> ModelPart {
+    let mut mesh = MeshDefinition::new();
+    let root = mesh.root();
+    let head_def = CubeDeformation::new(head_grow);
+    let body_def = CubeDeformation::new(body_grow);
+
+    mesh.add_or_replace_child(
+        root,
+        "head",
+        CubeListBuilder::create().add_box_with([-4.0, -8.0, -4.0], [8.0, 8.0, 8.0], head_def),
+        PartPose::ZERO,
+    );
+    mesh.add_or_replace_child(
+        root,
+        "body",
+        CubeListBuilder::create().add_box_with([-4.0, 0.0, -2.0], [8.0, 12.0, 4.0], body_def),
+        PartPose::ZERO,
+    );
+    mesh.add_or_replace_child(
+        root,
+        "right_arm",
+        CubeListBuilder::create().add_box_with([-3.0, -2.0, -2.0], [4.0, 12.0, 4.0], body_def),
+        PartPose::offset(-5.0, 2.0, 0.0),
+    );
+    mesh.add_or_replace_child(
+        root,
+        "left_arm",
+        CubeListBuilder::create().add_box_with([-1.0, -2.0, -2.0], [4.0, 12.0, 4.0], body_def),
+        PartPose::offset(5.0, 2.0, 0.0),
+    );
+    mesh.add_or_replace_child(
+        root,
+        "right_leg",
+        CubeListBuilder::create().add_box_with([-2.0, 0.0, -2.0], [4.0, 12.0, 4.0], body_def),
+        PartPose::offset(-1.9, 12.0, 0.0),
+    );
+    mesh.add_or_replace_child(
+        root,
+        "left_leg",
+        CubeListBuilder::create().add_box_with([-2.0, 0.0, -2.0], [4.0, 12.0, 4.0], body_def),
+        PartPose::offset(1.9, 12.0, 0.0),
+    );
+
+    LayerDefinition::create(mesh, 16, 16).bake_root()
+}
+
+/// Hides outer player skin layers (hat, jacket, sleeves, pants) when Skin ESP is active
+/// so raised outer layers never poke through the sleek solid-color skin shell, while
+/// preserving the base body geometry for through-wall `entity_outline` silhouettes.
+pub fn apply_skin_player_pre(
+    host: &dyn ClientHost,
+    manager: &ModuleManager,
+    event: &mut RenderPlayerPreEvent<'_>,
+) {
+    if event.who.local {
+        return;
+    }
+    if resolve_skin_color(host, manager, event.player.id, event.player.kind).is_none() {
+        return;
+    }
+    for outer in [
+        HumanoidPart::Hat,
+        HumanoidPart::Jacket,
+        HumanoidPart::RightSleeve,
+        HumanoidPart::LeftSleeve,
+        HumanoidPart::RightPants,
+        HumanoidPart::LeftPants,
+    ] {
+        event.hidden.hide(outer);
+    }
+}
+
+/// Renders the fullbright solid-color skin shell over every limb of matching players
+/// and humanoid mobs, following their live animated `PosedParts`.
+pub fn apply_skin_living_post(
+    host: &dyn ClientHost,
+    manager: &ModuleManager,
+    event: &mut RenderLivingPostEvent<'_>,
+) {
+    let Some(posed) = event.parts else {
+        return;
+    };
+    let Some(rgb) = resolve_skin_color(host, manager, event.entity.id, event.entity.kind) else {
+        return;
+    };
+
+    let is_player = event.entity.kind == "minecraft:player";
+    // For players, outer layers were hidden in `render_player_pre`, so a tight 0.14 texel
+    // shell hugs the exact player silhouette with zero Z-fighting and zero puffiness.
+    let mut model = if is_player {
+        build_humanoid_skin_model(0.14, 0.14)
+    } else {
+        build_humanoid_skin_model(0.56, 0.32)
+    };
+
+    let mappings = [
+        (HumanoidPart::Head, "head"),
+        (HumanoidPart::Body, "body"),
+        (HumanoidPart::RightArm, "right_arm"),
+        (HumanoidPart::LeftArm, "left_arm"),
+        (HumanoidPart::RightLeg, "right_leg"),
+        (HumanoidPart::LeftLeg, "left_leg"),
+    ];
+    for (hp, name) in mappings {
+        if let Some(child) = model.get_child_mut(name) {
+            if let Some(src) = posed.get(hp) {
+                child.load_pose(src.pose);
+                child.visible = true;
+            } else {
+                child.visible = false;
+            }
+        }
+    }
+
+    event.draw.push();
+    event.draw.set_light(FULLBRIGHT_LIGHT);
+    if is_player {
+        // Matches Horizon's `AvatarRenderer.scale` (`0.9375`).
+        event.draw.scale([0.9375, 0.9375, 0.9375]);
+    } else if event.entity.baby {
+        event.draw.scale([0.5, 0.5, 0.5]);
+    }
+    // Model space (+y down, front -z, feet at y = 24 texels = 1.501 blocks).
+    event.draw.scale([1.0, -1.0, -1.0]);
+    event.draw.translate([0.0, -1.501, 0.0]);
+    if !event.draw.model_part(&model, SKIN_TEXTURE, rgb) {
+        event.draw.model_part(&model, SKIN_TEXTURE_FALLBACK, rgb);
+    }
+    event.draw.pop();
+}
+
+/// Applies Minecraft's native through-wall glowing outline in the matching Skin ESP color
+/// when `Style == Skin` and `Through Walls` is enabled (also highlights non-humanoid mobs).
+pub fn apply_skin_outline(
+    host: &dyn ClientHost,
+    manager: &ModuleManager,
+    event: &mut EntityOutlineEvent<'_>,
+) {
+    let esp = manager.get(ModuleId::Esp);
+    if !esp.enabled || esp.mode("style", 1) != 4 || !esp.bool("through_walls", true) {
+        return;
+    }
+    if let Some(rgb) = resolve_skin_color(host, manager, event.entity_id, event.kind) {
+        *event.outline = Some(rgb);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // 3D World Geometry (ESP + Tracers)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -361,6 +688,7 @@ pub fn render_world_geometry(
     view: &WorldRenderView,
     draw: &mut dyn WorldDrawContext,
     manager: &ModuleManager,
+    interp: &EntityInterpCache,
 ) {
     if !host.playing() {
         return;
@@ -432,7 +760,8 @@ pub fn render_world_geometry(
     };
     let esp_width = (esp.float("line_width", 1.6) as f32).clamp(0.5, 6.0);
     let esp_fill = esp.mode("style", 1) == 1;
-    let esp_fill_alpha = ((esp.float("fill_opacity", 0.16) * 255.0).round() as u32).clamp(0, 200) as u8;
+    let esp_fill_alpha =
+        ((esp.float("fill_opacity", 0.16) * 255.0).round() as u32).clamp(0, 200) as u8;
     let esp_color_mode = esp.mode("color_mode", 0);
     let esp_custom_color = esp.color("custom_color", theme.accent);
     let esp_ignore_invis = esp.bool("ignore_invisible", false);
@@ -465,20 +794,10 @@ pub fn render_world_geometry(
             continue;
         }
 
-        let Some([mut lo, mut hi]) = entity.bounding_box(host) else {
+        let Some(raw_bb) = entity.bounding_box(host) else {
             continue;
         };
-        // Smooth sub-tick interpolation for fluid 3D boxes.
-        if let Some(vel) = entity.velocity(host) {
-            let pt = view.partial_tick as f64;
-            for i in 0..3 {
-                let d = vel[i] * pt * 0.5;
-                if d.is_finite() && d.abs() < 2.0 {
-                    lo[i] += d;
-                    hi[i] += d;
-                }
-            }
-        }
+        let [lo, hi] = interp.interpolate_box(entity.id(), raw_bb, view.partial_tick);
         let center = [
             (lo[0] + hi[0]) * 0.5,
             (lo[1] + hi[1]) * 0.5,
@@ -512,7 +831,10 @@ pub fn render_world_geometry(
         if want_tracer && d <= tr_range && lines.len() < max_lines {
             let target = match tr_point {
                 0 => [center[0], lo[1] + 0.05, center[2]],
-                2 => entity.eye_position(host).unwrap_or([center[0], hi[1] - 0.15, center[2]]),
+                2 => entity
+                    .eye_position(host)
+                    .map(|e| interp.interpolate_eye(entity.id(), e, view.partial_tick))
+                    .unwrap_or([center[0], hi[1] - 0.15, center[2]]),
                 _ => center,
             };
             let color = entity_color(
@@ -549,6 +871,7 @@ pub fn render_screen_overlays(
     host: &dyn ClientHost,
     draw: &mut dyn DrawContext,
     manager: &ModuleManager,
+    interp: &EntityInterpCache,
     theme: &Theme,
     font: FontConfig,
 ) {
@@ -630,6 +953,7 @@ pub fn render_screen_overlays(
     }
     list.sort_by(|a, b| b.0.total_cmp(&a.0));
 
+    let pt = interp.last_partial_tick;
     for (d, entity, kind_id, invis) in list {
         let want_esp = (esp_2d_box || esp_health_bar)
             && d <= esp_range
@@ -644,9 +968,10 @@ pub fn render_screen_overlays(
             continue;
         }
 
-        let Some([lo, hi]) = entity.bounding_box(host) else {
+        let Some(raw_bb) = entity.bounding_box(host) else {
             continue;
         };
+        let [lo, hi] = interp.interpolate_box(entity.id(), raw_bb, pt);
 
         if want_esp
             && let Some([x0, y0, x1, y1]) = project_aabb(host, size, lo, hi)
@@ -997,4 +1322,38 @@ fn look_dir(yaw_deg: f32, pitch_deg: f32) -> [f64; 3] {
     let pitch = (pitch_deg as f64).to_radians();
     let cp = pitch.cos();
     [-yaw.sin() * cp, -pitch.sin(), yaw.cos() * cp]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interp_cache_standing_has_zero_bounce_and_moving_lerps_smoothly() {
+        let mut cache = EntityInterpCache::default();
+        let standing = [[10.0, 64.0, 20.0], [10.6, 65.8, 20.6]];
+        cache.prev_boxes.insert(1, standing);
+        // Standing entity stays completely locked across all partial ticks.
+        assert_eq!(cache.interpolate_box(1, standing, 0.0), standing);
+        assert_eq!(cache.interpolate_box(1, standing, 0.5), standing);
+        assert_eq!(cache.interpolate_box(1, standing, 1.0), standing);
+
+        // Moving entity linearly interpolates between prev and curr.
+        let moved = [[11.0, 64.0, 20.0], [11.6, 65.8, 20.6]];
+        let mid = cache.interpolate_box(1, moved, 0.5);
+        assert!((mid[0][0] - 10.5).abs() < 1e-9);
+        assert!((mid[1][0] - 11.1).abs() < 1e-9);
+
+        // Teleport snaps immediately instead of stretching.
+        let teleported = [[100.0, 64.0, 20.0], [100.6, 65.8, 20.6]];
+        assert_eq!(cache.interpolate_box(1, teleported, 0.5), teleported);
+    }
+
+    #[test]
+    fn skin_model_builds_all_six_humanoid_limbs() {
+        let model = build_humanoid_skin_model(0.14, 0.14);
+        for name in ["head", "body", "right_arm", "left_arm", "right_leg", "left_leg"] {
+            assert!(model.get_child(name).is_some(), "missing limb {name}");
+        }
+    }
 }
