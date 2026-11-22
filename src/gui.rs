@@ -374,7 +374,7 @@ impl ClickGuiState {
 
         // Brand title on left
         let title = "STAR";
-        let ver = concat!("v", env!("CARGO_PKG_VERSION"));
+        let ver = "v0.2.5";
         let ty = font.center_y(0.0, TOP_BAR_H - 1.0);
         font.draw_header(draw, title, [10.0, ty], theme.accent);
         let title_w = font.width(draw, title, font.bold_headers);
