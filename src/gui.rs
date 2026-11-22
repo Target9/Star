@@ -84,6 +84,8 @@ pub struct ClickGuiState {
     listening_bind: Option<BindTarget>,
     entity_picker: Option<EntityPickerState>,
     open_dropdown: Option<DropdownState>,
+    drawer_anim: Vec<f32>,
+    last_frame_ms: Option<u64>,
     settings_scroll: f32,
     hud_scroll: f32,
     hits: Vec<HitRegion>,
@@ -108,6 +110,8 @@ impl Default for ClickGuiState {
             listening_bind: None,
             entity_picker: None,
             open_dropdown: None,
+            drawer_anim: Vec::new(),
+            last_frame_ms: None,
             settings_scroll: 0.0,
             hud_scroll: 0.0,
             hits: Vec::new(),
@@ -197,6 +201,41 @@ impl ClickGuiState {
         self.search_focused = false;
         self.entity_picker = None;
         self.open_dropdown = None;
+        self.last_frame_ms = None;
+    }
+
+    fn step_animations(&mut self, now_ms: u64, manager: &ModuleManager) {
+        if self.drawer_anim.len() != manager.modules.len() {
+            self.drawer_anim = manager
+                .modules
+                .iter()
+                .map(|m| if m.expanded { 1.0 } else { 0.0 })
+                .collect();
+        }
+
+        let dt = self
+            .last_frame_ms
+            .map_or(0.0, |prev| (now_ms.saturating_sub(prev) as f32 / 1000.0).clamp(0.0, 0.05));
+        self.last_frame_ms = Some(now_ms);
+
+        // ~140ms snappy open/close duration
+        let step = dt / 0.14;
+        if step <= 0.0 {
+            return;
+        }
+        for (anim, m) in self.drawer_anim.iter_mut().zip(&manager.modules) {
+            if m.expanded {
+                *anim = (*anim + step).min(1.0);
+            } else {
+                *anim = (*anim - step).max(0.0);
+            }
+        }
+    }
+
+    fn drawer_ease(&self, idx: usize) -> f32 {
+        let t = self.drawer_anim.get(idx).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+        let inv = 1.0 - t;
+        1.0 - inv * inv * inv
     }
 
     /// Renders the entire ClickGUI and rebuilds interactive hit regions for the frame.
@@ -221,7 +260,10 @@ impl ClickGuiState {
             self.layout_initialized = true;
         }
 
-        let theme = Theme::from_manager(manager, host.millis());
+        let now_ms = host.millis();
+        self.step_animations(now_ms, manager);
+
+        let theme = Theme::from_manager(manager, now_ms);
         let font = FontConfig::from_manager(manager);
         let gui_mod = manager.get(ModuleId::ClickGui);
         let use_blur = gui_mod.bool("blur", true);
@@ -533,9 +575,10 @@ impl ClickGuiState {
             let mut h = 0.0;
             for &idx in &mod_indices {
                 h += row_h;
-                let m = &manager.modules[idx];
-                if m.expanded {
-                    h += module_drawer_height(m, true);
+                let ease = self.drawer_ease(idx);
+                if ease > 0.005 {
+                    let m = &manager.modules[idx];
+                    h += module_drawer_height(m, true) * ease;
                 }
             }
             h + 2.0
@@ -741,20 +784,40 @@ impl ClickGuiState {
 
                 cursor_y += row_h;
 
-                if expanded {
-                    cursor_y = self.render_settings_list(
-                        draw,
-                        idx,
-                        px,
-                        cursor_y,
-                        panel_w,
-                        body_rect,
-                        mouse,
-                        manager,
-                        theme,
-                        font,
-                        true,
-                    );
+                let ease = self.drawer_ease(idx);
+                if ease > 0.005 {
+                    let full_h = module_drawer_height(&manager.modules[idx], true);
+                    let anim_h = full_h * ease;
+                    let anim_rect = [px, cursor_y, panel_w, anim_h];
+                    if let Some(drawer_clip) = intersect_rects(anim_rect, body_rect) {
+                        let sub_clip = draw.push_clip(drawer_clip).is_ok();
+                        let hit_mark = self.hits.len();
+                        let drawer_mouse = if expanded && ease > 0.80 {
+                            mouse
+                        } else {
+                            [-9999.0, -9999.0]
+                        };
+                        let _ = self.render_settings_list(
+                            draw,
+                            idx,
+                            px,
+                            cursor_y,
+                            panel_w,
+                            drawer_clip,
+                            drawer_mouse,
+                            manager,
+                            theme,
+                            font,
+                            true,
+                        );
+                        if !expanded || ease < 0.80 {
+                            self.hits.truncate(hit_mark);
+                        }
+                        if sub_clip {
+                            let _ = draw.pop_clip();
+                        }
+                    }
+                    cursor_y += anim_h;
                 }
 
                 // Subtle separator
@@ -2041,7 +2104,16 @@ impl ClickGuiState {
                         }
                     }
                     1 => {
-                        manager.modules[idx].expanded = !manager.modules[idx].expanded;
+                        let opening = !manager.modules[idx].expanded;
+                        if opening {
+                            for (i, m) in manager.modules.iter_mut().enumerate() {
+                                if i != idx && m.category != Category::Client {
+                                    m.expanded = false;
+                                }
+                            }
+                        }
+                        manager.modules[idx].expanded = opening;
+                        self.open_dropdown = None;
                     }
                     2 if manager.modules[idx].id != ModuleId::ClickGui => {
                         self.listening_bind = Some(BindTarget::Module(idx));
@@ -2594,5 +2666,37 @@ mod tests {
         assert_eq!(gui.entity_picker.as_ref().unwrap().search, "zo");
         assert!(gui.key_pressed("key.keyboard.escape", &mut mgr));
         assert!(gui.entity_picker.is_none());
+    }
+
+    #[test]
+    fn single_module_accordion_and_drawer_animation() {
+        let mut mgr = ModuleManager::new();
+        let mut gui = ClickGuiState::default();
+        gui.hits.push(HitRegion {
+            rect: [0.0, 0.0, 100.0, 20.0],
+            kind: HitKind::ModuleRow(0),
+            tooltip: None,
+        });
+        assert!(gui.mouse_pressed([10.0, 10.0], 1, &mut mgr));
+        assert!(mgr.modules[0].expanded);
+
+        gui.hits.clear();
+        gui.hits.push(HitRegion {
+            rect: [0.0, 0.0, 100.0, 20.0],
+            kind: HitKind::ModuleRow(1),
+            tooltip: None,
+        });
+        assert!(gui.mouse_pressed([10.0, 10.0], 1, &mut mgr));
+        assert!(!mgr.modules[0].expanded);
+        assert!(mgr.modules[1].expanded);
+
+        gui.step_animations(1000, &mgr);
+        gui.step_animations(1040, &mgr);
+        assert!(gui.drawer_ease(1) > 0.0);
+        gui.step_animations(1090, &mgr);
+        gui.step_animations(1140, &mgr);
+        gui.step_animations(1190, &mgr);
+        assert!((gui.drawer_ease(1) - 1.0).abs() < 1e-4);
+        assert!(gui.drawer_ease(0) < 1e-4);
     }
 }
