@@ -561,7 +561,8 @@ impl ClickGuiState {
 
         // Brand title on left
         let title = "STAR";
-        let ver = concat!("v", env!("CARGO_PKG_VERSION"));
+        // The Horizon launcher compiles with plain rustc, so Cargo's env vars do not exist.
+        let ver = "v0.3.0";
         let ty = font.center_y(0.0, TOP_BAR_H - 1.0);
         font.draw_header(draw, title, [10.0, ty], theme.accent);
         let title_w = font.width(draw, title, font.bold_headers);
