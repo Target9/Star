@@ -5,28 +5,12 @@
 //! activation conditions, line-of-sight filtering, smoothing, deadzone, and
 //! movement prediction.
 
-use mod_api::{
-    ClientHost, ClipBlock, ClipFluid, EntityRef, Hand, WorldDepth, WorldDrawContext, WorldLine,
-};
+use mod_api::{ClientHost, ClipBlock, ClipFluid, EntityRef, Hand};
 
 use crate::entity_filter::{EntityFilter, pretty_entity_id};
 use crate::module::{Category, Module, ModuleId};
+use crate::modules::lock_visuals::LockTarget;
 use crate::settings::Setting;
-use crate::theme::with_alpha;
-
-/// Snapshot of the currently tracked target for HUD display.
-#[derive(Clone, Debug)]
-pub struct AimTargetInfo {
-    pub name: String,
-    pub distance: f64,
-    pub angle_deg: f32,
-    pub health: Option<f32>,
-    pub max_health: Option<f32>,
-    /// Tab-list latency in ms when known (players only); negative / None when unknown.
-    pub ping_ms: Option<i32>,
-    pub aim_point: [f64; 3],
-}
-
 /// Constructs the `Aim Assist` module definition with all customizable settings.
 pub fn build_module() -> Module {
     Module {
@@ -161,7 +145,7 @@ pub fn build_module() -> Module {
     }
 }
 
-/// Settings that used to live on Aim Assist and now belong to [`build_visuals_module`].
+/// Settings that used to live on Aim Assist and now belong to `Lock Visuals`.
 /// Old configs are migrated by `config::deserialize`.
 pub const MOVED_VISUAL_SETTINGS: [&str; 8] = [
     "show_target_hud",
@@ -174,77 +158,6 @@ pub const MOVED_VISUAL_SETTINGS: [&str; 8] = [
     "show_range_circle",
 ];
 
-/// Constructs the `Aim Visuals` module: everything Aim Assist draws, as its own module.
-///
-/// It reads Aim Assist's range and FOV, so the FOV ring and range circle also work as a
-/// preview while tuning those values, even with Aim Assist switched off. The target
-/// info only appears while Aim Assist is actually tracking something.
-pub fn build_visuals_module() -> Module {
-    Module {
-        id: ModuleId::AimVisuals,
-        key: "aim_visuals",
-        name: "Aim Visuals",
-        description: "Target info, FOV ring and range circle for Aim Assist.",
-        category: Category::Render,
-        enabled: false,
-        keybind: None,
-        expanded: false,
-        show_in_arraylist: false,
-        settings: vec![
-            Setting::bool(
-                "show_target_hud",
-                "Target HUD",
-                "Show a compact info box and reticle for the target Aim Assist is tracking.",
-                true,
-            )
-            .group("Target"),
-            Setting::bool(
-                "hud_name",
-                "Name",
-                "Show the target's name in the Target HUD.",
-                true,
-            ),
-            Setting::bool(
-                "hud_health",
-                "Health",
-                "Show the target's health bar in the Target HUD.",
-                true,
-            ),
-            Setting::bool(
-                "hud_distance",
-                "Distance",
-                "Show distance to the target in the Target HUD.",
-                true,
-            ),
-            Setting::bool(
-                "hud_angle",
-                "Angle",
-                "Show angular offset to the target in the Target HUD.",
-                true,
-            ),
-            Setting::bool(
-                "hud_ping",
-                "Ping",
-                "Show the target's tab-list ping (players) in the Target HUD.",
-                true,
-            ),
-            Setting::bool(
-                "show_fov_circle",
-                "FOV Ring",
-                "Draw a ring around the crosshair sized to the Aim Assist FOV vs your camera FOV.",
-                true,
-            )
-            .group("Indicators"),
-            Setting::bool(
-                "show_range_circle",
-                "Range Circle",
-                "Draw a circle on the ground showing the Aim Assist range.",
-                true,
-            ),
-        ],
-    }
-}
-
 /// Runs one step of Aim Assist. `tick_scale` is `1.0` for a 50ms client tick,
 /// or `elapsed_secs * 20.0` for per-frame updates.
 pub fn step(
@@ -252,7 +165,7 @@ pub fn step(
     module: &Module,
     tick_scale: f32,
     is_frame_hook: bool,
-) -> Option<AimTargetInfo> {
+) -> Option<LockTarget> {
     if !module.enabled || !host.playing() {
         return None;
     }
@@ -330,7 +243,9 @@ pub fn step(
     };
     let ping_ms = lookup_ping(host, &name);
 
-    Some(AimTargetInfo {
+    Some(LockTarget {
+        source: ModuleId::AimAssist,
+        entity: Some(target),
         name,
         distance,
         angle_deg,
@@ -338,6 +253,8 @@ pub fn step(
         max_health,
         ping_ms,
         aim_point: point,
+        fov_deg: Some(fov),
+        range: Some(range),
     })
 }
 
@@ -608,54 +525,6 @@ pub fn dist(a: [f64; 3], b: [f64; 3]) -> f64 {
     let dy = a[1] - b[1];
     let dz = a[2] - b[2];
     (dx * dx + dy * dy + dz * dz).sqrt()
-}
-
-/// Draws a flat range circle on the ground under the local player, sized to Aim Assist's
-/// range. `visuals` is the Aim Visuals module (which decides whether it shows) and `aim`
-/// the Aim Assist module (which supplies the range).
-pub fn render_range_circle(
-    host: &dyn ClientHost,
-    draw: &mut dyn WorldDrawContext,
-    visuals: &Module,
-    aim: &Module,
-    accent: u32,
-) {
-    if !visuals.enabled || !visuals.bool("show_range_circle", true) || !host.playing() {
-        return;
-    }
-    let module = aim;
-    let Some(player) = host.camera_entity() else {
-        return;
-    };
-    let Some(feet) = player.position(host) else {
-        return;
-    };
-    let range = module.float("range", 4.5).clamp(0.5, 32.0);
-    let y = feet[1] + 0.05;
-    let segments = 48usize;
-    let usage = draw.usage();
-    let budget = usage.line_capacity.saturating_sub(usage.lines) as usize;
-    if budget < segments {
-        return;
-    }
-
-    let mut lines = Vec::with_capacity(segments);
-    let color = with_alpha(accent, 0xB0);
-    let width = 1.6_f32;
-    for i in 0..segments {
-        let a0 = (i as f64 / segments as f64) * std::f64::consts::TAU;
-        let a1 = ((i + 1) as f64 / segments as f64) * std::f64::consts::TAU;
-        let (s0, c0) = a0.sin_cos();
-        let (s1, c1) = a1.sin_cos();
-        lines.push(WorldLine::new(
-            [feet[0] + c0 * range, y, feet[2] + s0 * range],
-            [feet[0] + c1 * range, y, feet[2] + s1 * range],
-            color,
-            width,
-            WorldDepth::ThroughWalls,
-        ));
-    }
-    let _ = draw.lines(&lines);
 }
 
 #[cfg(test)]

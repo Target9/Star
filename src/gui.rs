@@ -25,8 +25,8 @@ const SETTING_H: f32 = 16.0;
 const GROUP_H: f32 = 14.0;
 const COLOR_CHANNEL_H: f32 = 13.0;
 const COLOR_DRAWER_H: f32 = COLOR_CHANNEL_H * 4.0 + 4.0;
-/// Rows above a module's own settings: Bind, Bind Mode, Favorite and Reset Module.
-const MODULE_META_ROWS: f32 = 4.0;
+/// Rows above a module's own settings: Bind, Bind Mode and Reset Module.
+const MODULE_META_ROWS: f32 = 3.0;
 
 /// Clipboard work the GUI cannot do itself because it has no host access.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -954,11 +954,26 @@ impl ClickGuiState {
                         );
                     }
 
-                    let mut name_x = px + 7.0;
-                    if manager.is_favorite(manager.modules[idx].id) {
-                        font.draw_header(draw, "*", [name_x, text_y], theme.accent);
-                        name_x += font.width(draw, "*", font.bold_headers) + 3.0;
-                    }
+                    let favorite = manager.is_favorite(manager.modules[idx].id);
+                    let star_size = 9.0;
+                    let star_x = px + 5.0;
+                    let star_y = (cursor_y + (row_h - star_size) * 0.5).round();
+                    let star_hit = [star_x - 2.0, cursor_y, star_size + 6.0, row_h];
+                    let star_hover = rect_contains(body_rect, mouse) && rect_contains(star_hit, mouse);
+                    draw_star(
+                        draw,
+                        [star_x, star_y],
+                        if favorite {
+                            theme.accent
+                        } else if star_hover {
+                            theme.text
+                        } else {
+                            theme.text_muted
+                        },
+                        favorite || star_hover,
+                    );
+
+                    let name_x = star_x + star_size + 4.0;
                     let name_max_w = (right_edge - (name_x + 3.0)).max(20.0);
                     font.draw_fitted(
                         draw,
@@ -970,7 +985,10 @@ impl ClickGuiState {
                         false,
                     );
 
-                    if row_hover {
+                    let star_tip = "Click the star to pin this module to the top of its panel.";
+                    if star_hover {
+                        self.hovered_tooltip = Some(star_tip.to_owned());
+                    } else if row_hover {
                         self.hovered_tooltip = Some(mod_desc.to_owned());
                     }
 
@@ -979,6 +997,13 @@ impl ClickGuiState {
                             rect: hit_rect,
                             kind: HitKind::ModuleRow(idx),
                             tooltip: Some(mod_desc.to_owned()),
+                        });
+                    }
+                    if let Some(hit_rect) = intersect_rects(star_hit, body_rect) {
+                        self.hits.push(HitRegion {
+                            rect: hit_rect,
+                            kind: HitKind::ModuleFavorite(idx),
+                            tooltip: Some(star_tip.to_owned()),
                         });
                     }
                 }
@@ -1212,21 +1237,13 @@ impl ClickGuiState {
             y += SETTING_H;
 
             let mode = manager.bind_mode(m.id);
-            let favorite = manager.is_favorite(m.id);
-            let meta_rows: [(&str, &str, bool, HitKind, &str); 3] = [
+            let meta_rows: [(&str, &str, bool, HitKind, &str); 2] = [
                 (
                     "Bind Mode",
                     mode.label(),
                     mode == BindMode::Hold,
                     HitKind::ModuleBindMode(mod_idx),
                     "Toggle: each press flips the module. Hold: it is on only while the key is held.",
-                ),
-                (
-                    "Favorite",
-                    if favorite { "On" } else { "Off" },
-                    favorite,
-                    HitKind::ModuleFavorite(mod_idx),
-                    "Favorites are pinned to the top of their panel and marked with a star.",
                 ),
                 (
                     "Reset Module",
@@ -3500,6 +3517,62 @@ fn set_color_channel(setting: &mut crate::settings::Setting, channel: u8, frac: 
             2 => (*value & 0xFFFF_FF00) | byte,         // B
             _ => (*value & 0x00FF_FFFF) | (byte << 24), // A
         };
+    }
+}
+
+/// 9×9 star. Filled when the module is a favorite; outline otherwise.
+fn draw_star(draw: &mut dyn DrawContext, origin: [f32; 2], argb: u32, filled: bool) {
+    let rows: [&str; 9] = if filled {
+        [
+            "....#....",
+            "...###...",
+            "..#####..",
+            "#########",
+            ".#######.",
+            "..#####..",
+            "..#...#..",
+            ".#.....#.",
+            "#.......#",
+        ]
+    } else {
+        [
+            "....#....",
+            "...#.#...",
+            "..#...#..",
+            "#.......#",
+            ".#.....#.",
+            "..#...#..",
+            "..#...#..",
+            ".#.....#.",
+            "#.......#",
+        ]
+    };
+    let [ox, oy] = origin;
+    for (row, pattern) in rows.iter().enumerate() {
+        let mut run = None;
+        for (col, ch) in pattern.chars().enumerate() {
+            if ch == '#' {
+                if run.is_none() {
+                    run = Some(col);
+                }
+            } else if let Some(start) = run.take() {
+                draw.fill(
+                    [ox + start as f32, oy + row as f32, (col - start) as f32, 1.0],
+                    argb,
+                );
+            }
+        }
+        if let Some(start) = run {
+            draw.fill(
+                [
+                    ox + start as f32,
+                    oy + row as f32,
+                    (pattern.len() - start) as f32,
+                    1.0,
+                ],
+                argb,
+            );
+        }
     }
 }
 

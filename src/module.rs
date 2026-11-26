@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use crate::entity_filter::EntityFilter;
 use crate::font::{DEFAULT_FONT_INDEX, FONT_PRESETS};
-use crate::modules::{aim_assist, extras, fast_mine, movement, visuals};
+use crate::modules::{aim_assist, extras, fast_mine, lock_visuals, movement, visuals};
 use crate::settings::Setting;
 use crate::theme::THEME_PRESETS;
 
@@ -85,7 +85,7 @@ impl Category {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ModuleId {
     AimAssist,
-    AimVisuals,
+    LockVisuals,
     FastMine,
     Esp,
     Tracers,
@@ -110,7 +110,7 @@ impl ModuleId {
     /// Every module id, in registration order.
     pub const ALL: [ModuleId; 20] = [
         ModuleId::AimAssist,
-        ModuleId::AimVisuals,
+        ModuleId::LockVisuals,
         ModuleId::FastMine,
         ModuleId::Esp,
         ModuleId::Tracers,
@@ -255,7 +255,7 @@ impl Module {
             ModuleId::DamageIndicators => Some(format!("{:.0}m", self.float("range", 32.0))),
             ModuleId::Radar => Some(format!("{:.0}m", self.float("range", 48.0))),
             ModuleId::Sprint => Some(self.mode_str("mode", "Forward").to_owned()),
-            ModuleId::AimVisuals
+            ModuleId::LockVisuals
             | ModuleId::NoFog
             | ModuleId::Camera
             | ModuleId::ToggleSneak
@@ -316,7 +316,7 @@ impl ModuleManager {
     pub fn new() -> Self {
         let modules = vec![
             aim_assist::build_module(),
-            aim_assist::build_visuals_module(),
+            lock_visuals::build_module(),
             fast_mine::build_module(),
             visuals::build_esp_module(),
             visuals::build_tracers_module(),

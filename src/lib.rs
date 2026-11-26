@@ -32,7 +32,8 @@ use mod_api::{
 
 use crate::gui::{ClickGuiState, ClipboardAction};
 use crate::module::{ModuleId, ModuleManager};
-use crate::modules::aim_assist::{self, AimTargetInfo};
+use crate::modules::aim_assist;
+use crate::modules::lock_visuals::{self, LockBoard};
 use crate::modules::movement::{MoveConfig, MoveInputState};
 use crate::modules::trackers::Trackers;
 use crate::modules::{extras, fast_mine, visuals};
@@ -49,7 +50,7 @@ const HUD_OWNERS: &[ModuleId] = &[
     ModuleId::ItemEsp,
     ModuleId::DamageIndicators,
     ModuleId::Radar,
-    ModuleId::AimVisuals,
+    ModuleId::LockVisuals,
 ];
 /// Modules whose code runs inside the world-geometry hook.
 const WORLD_OWNERS: &[ModuleId] = &[
@@ -59,7 +60,7 @@ const WORLD_OWNERS: &[ModuleId] = &[
     ModuleId::StorageEsp,
     ModuleId::Trajectories,
     ModuleId::Breadcrumbs,
-    ModuleId::AimVisuals,
+    ModuleId::LockVisuals,
 ];
 /// Modules that need a per-tick world sample.
 const TICK_OWNERS: &[ModuleId] = &[
@@ -77,7 +78,8 @@ const TICK_OWNERS: &[ModuleId] = &[
 struct ClientState {
     manager: ModuleManager,
     gui: ClickGuiState,
-    aim_target: Option<AimTargetInfo>,
+    /// Locks reported by modules like Aim Assist, shown by Lock Visuals.
+    lock: LockBoard,
     interp: visuals::EntityInterpCache,
     trackers: Trackers,
     toasts: Toasts,
@@ -91,7 +93,7 @@ impl ClientState {
         Self {
             manager: ModuleManager::new(),
             gui: ClickGuiState::default(),
-            aim_target: None,
+            lock: LockBoard::default(),
             interp: visuals::EntityInterpCache::default(),
             trackers: Trackers::default(),
             toasts: Toasts::default(),
@@ -259,7 +261,7 @@ fn refresh_enabled_snapshot() {
 fn tick_pre(host: &mut dyn ClientHost) {
     if !mod_active(host) {
         let mut st = lock_state();
-        st.aim_target = None;
+        st.lock.clear();
         st.interp.clear();
         return;
     }
@@ -274,6 +276,7 @@ fn tick_pre(host: &mut dyn ClientHost) {
             ModuleId::Tracers,
             ModuleId::Nametags,
             ModuleId::ItemEsp,
+            ModuleId::LockVisuals,
         ]
         .iter()
         .any(|&id| st.manager.is_enabled(id));
@@ -307,9 +310,11 @@ fn tick_pre(host: &mut dyn ClientHost) {
     guard::run(&[ModuleId::AimAssist], (), || {
         if aim_module.enabled && aim_module.mode("update_rate", 0) == 1 {
             let target = aim_assist::step(host, &aim_module, 1.0, false);
-            lock_state().aim_target = target;
+            let now = host.millis();
+            lock_state().lock.publish(ModuleId::AimAssist, target, now);
         } else if !aim_module.enabled || !host.playing() {
-            lock_state().aim_target = None;
+            let now = host.millis();
+            lock_state().lock.publish(ModuleId::AimAssist, None, now);
         }
     });
 }
@@ -391,7 +396,11 @@ impl mod_api::Hooks for Mod {
             if aim_module.enabled && aim_module.mode("update_rate", 0) == 0 {
                 let tick_scale = (event.elapsed.as_secs_f32() * 20.0).clamp(0.02, 2.0);
                 let target = aim_assist::step(host, &aim_module, tick_scale, true);
-                lock_state().aim_target = target;
+                let now = host.millis();
+                lock_state().lock.publish(ModuleId::AimAssist, target, now);
+            } else if !aim_module.enabled {
+                let now = host.millis();
+                lock_state().lock.publish(ModuleId::AimAssist, None, now);
             }
         });
     }
@@ -435,10 +444,16 @@ impl mod_api::Hooks for Mod {
                 &st.interp,
                 &st.trackers,
             );
-            let aim = st.manager.get(ModuleId::AimAssist);
-            let visuals = st.manager.get(ModuleId::AimVisuals);
             let theme = theme::Theme::from_manager(&st.manager, host.millis());
-            aim_assist::render_range_circle(host, event.draw, visuals, aim, theme.accent);
+            lock_visuals::render_world(
+                host,
+                event.view,
+                event.draw,
+                &st.manager,
+                &st.lock,
+                &st.interp,
+                theme.accent,
+            );
         });
     }
 
@@ -547,7 +562,7 @@ impl mod_api::Hooks for Mod {
             let ClientState {
                 manager,
                 interp,
-                aim_target,
+                lock,
                 trackers,
                 toasts,
                 ..
@@ -557,7 +572,7 @@ impl mod_api::Hooks for Mod {
                 event.draw,
                 manager,
                 interp,
-                aim_target.as_ref(),
+                lock,
                 trackers,
                 toasts,
             );
