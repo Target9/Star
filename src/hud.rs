@@ -40,16 +40,27 @@ pub fn render(
 
     if aim.enabled {
         if aim.bool("show_fov_circle", false) {
-            let fov = aim.int("fov", 90) as f32;
-            if fov < 360.0 {
-                draw_fov_ring(draw, size, fov, with_alpha(theme.accent, 0x88));
+            let aim_fov = aim.int("fov", 90) as f32;
+            if aim_fov < 360.0 {
+                let camera_fov = host
+                    .camera()
+                    .map(|c| c.fov_degrees)
+                    .filter(|f| f.is_finite() && *f > 1.0)
+                    .unwrap_or_else(|| host.graphics_options().fov.max(30.0));
+                draw_fov_ring(
+                    draw,
+                    size,
+                    aim_fov,
+                    camera_fov,
+                    with_alpha(theme.accent, 0x88),
+                );
             }
         }
         if aim.bool("show_target_hud", true)
             && let Some(info) = target
         {
             draw_target_reticle(host, draw, size, info.aim_point, theme.accent);
-            draw_target_hud(draw, size, info, &theme, font, bg_alpha);
+            draw_target_hud(draw, size, info, aim, &theme, font, bg_alpha);
         }
     }
 }
@@ -223,22 +234,64 @@ fn draw_target_reticle(
     draw.fill([sx - t * 0.5, sy - r, t, r * 2.0], color);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_target_hud(
     draw: &mut dyn DrawContext,
     size: [f32; 2],
     info: &AimTargetInfo,
+    aim: &crate::module::Module,
     theme: &Theme,
     font: FontConfig,
     bg_alpha: u8,
 ) {
-    let header = &info.name;
-    let stats = format!("{:.1}m  |  {:.1}°", info.distance, info.angle_deg);
+    let show_name = aim.bool("hud_name", true);
+    let show_health = aim.bool("hud_health", true);
+    let show_distance = aim.bool("hud_distance", true);
+    let show_angle = aim.bool("hud_angle", true);
+    let show_ping = aim.bool("hud_ping", true);
+
+    let mut stats = String::new();
+    if show_distance {
+        stats.push_str(&format!("{:.1}m", info.distance));
+    }
+    if show_angle {
+        if !stats.is_empty() {
+            stats.push_str("  |  ");
+        }
+        stats.push_str(&format!("{:.1}°", info.angle_deg));
+    }
+    if show_ping {
+        if !stats.is_empty() {
+            stats.push_str("  |  ");
+        }
+        match info.ping_ms {
+            Some(ms) => stats.push_str(&format!("{ms}ms")),
+            None => stats.push_str("--ms"),
+        }
+    }
+
+    let header = if show_name { info.name.as_str() } else { "" };
+    if header.is_empty() && stats.is_empty() && !show_health {
+        return;
+    }
+
     let content_w = font
         .width(draw, header, font.bold_headers)
-        .max(font.width(draw, &stats, false));
+        .max(font.width(draw, &stats, false))
+        .max(48.0);
     let w = (content_w + 18.0).max(108.0);
-    let has_hp = info.health.is_some() && info.max_health.is_some_and(|m| m > 0.0);
-    let h = if has_hp { 33.0 } else { 24.0 };
+    let has_hp = show_health && info.health.is_some() && info.max_health.is_some_and(|m| m > 0.0);
+    let mut h: f32 = 8.0;
+    if show_name {
+        h += 10.0;
+    }
+    if !stats.is_empty() {
+        h += 10.0;
+    }
+    if has_hp {
+        h += 9.0;
+    }
+    h = h.max(18.0);
 
     let x = size[0] * 0.5 + 16.0;
     let y = size[1] * 0.5 + 10.0;
@@ -248,31 +301,47 @@ fn draw_target_hud(
         with_alpha(theme.panel_bg, bg_alpha.max(0xA8)),
     );
     draw.fill([x, y, 2.0, h], theme.accent);
-    font.draw_header(draw, header, [x + 6.0, y + 4.0], theme.text);
-    font.draw_body(draw, &stats, [x + 6.0, y + 13.5], theme.text_muted);
 
-    if let (Some(hp), Some(max_hp)) = (info.health, info.max_health)
+    let mut cursor_y = y + 4.0;
+    if show_name {
+        font.draw_header(draw, header, [x + 6.0, cursor_y], theme.text);
+        cursor_y += 10.0;
+    }
+    if !stats.is_empty() {
+        font.draw_body(draw, &stats, [x + 6.0, cursor_y], theme.text_muted);
+        cursor_y += 10.0;
+    }
+
+    if let (true, Some(hp), Some(max_hp)) = (show_health, info.health, info.max_health)
         && max_hp > 0.0
     {
         let frac = (hp / max_hp).clamp(0.0, 1.0);
         let bar_x = x + 6.0;
-        let bar_y = y + 24.5;
+        let bar_y = cursor_y + 1.0;
         let bar_w = w - 12.0;
         draw.fill([bar_x, bar_y, bar_w, 3.5], theme.slider_track);
         draw.fill([bar_x, bar_y, bar_w * frac, 3.5], theme.accent);
     }
 }
 
-fn draw_fov_ring(draw: &mut dyn DrawContext, size: [f32; 2], fov_deg: f32, color: u32) {
+/// Screen-space FOV ring sized so the Aim Assist angular cone matches the live camera FOV.
+fn draw_fov_ring(
+    draw: &mut dyn DrawContext,
+    size: [f32; 2],
+    aim_fov_deg: f32,
+    camera_fov_deg: f32,
+    color: u32,
+) {
     let cx = size[0] * 0.5;
     let cy = size[1] * 0.5;
-    let half_rad = (fov_deg * 0.5).clamp(1.0, 85.0).to_radians();
-    let ref_rad = 35.0_f32.to_radians();
-    let radius = ((half_rad.tan() / ref_rad.tan()) * (size[1] * 0.5))
-        .clamp(12.0, size[1].min(size[0]) * 0.48);
+    let aim_half = (aim_fov_deg * 0.5).clamp(0.5, 89.0).to_radians();
+    let cam_half = (camera_fov_deg * 0.5).clamp(1.0, 89.0).to_radians();
+    // Project the Aim Assist angular radius through the camera's vertical FOV frustum.
+    let radius = ((aim_half.tan() / cam_half.tan()) * (size[1] * 0.5))
+        .clamp(8.0, size[1].min(size[0]) * 0.55);
 
-    let segments = 36usize;
-    let thickness = 1.0_f32;
+    let segments = 48usize;
+    let thickness = 1.15_f32;
     for i in 0..segments {
         let a0 = (i as f32 / segments as f32) * std::f32::consts::TAU;
         let a1 = ((i + 1) as f32 / segments as f32) * std::f32::consts::TAU;
@@ -289,5 +358,22 @@ fn draw_fov_ring(draw: &mut dyn DrawContext, size: [f32; 2], fov_deg: f32, color
             ],
             color,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn fov_ring_grows_with_aim_fov_and_shrinks_with_camera_fov() {
+        let aim_half = 45.0_f32.to_radians();
+        let cam_70 = 35.0_f32.to_radians();
+        let cam_90 = 45.0_f32.to_radians();
+        let h = 360.0_f32;
+        let r70 = (aim_half.tan() / cam_70.tan()) * (h * 0.5);
+        let r90 = (aim_half.tan() / cam_90.tan()) * (h * 0.5);
+        assert!(r70 > r90, "wider camera FOV must shrink the on-screen ring");
+        let aim_small_half = (20.0_f32 * 0.5).to_radians();
+        let r_small = (aim_small_half.tan() / cam_90.tan()) * (h * 0.5);
+        assert!(r90 > r_small, "smaller Aim Assist FOV must shrink the ring");
     }
 }

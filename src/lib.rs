@@ -18,12 +18,13 @@ use std::sync::{Mutex, OnceLock};
 
 use mod_api::{
     self, CameraDistanceEvent, CameraShakeEvent, ClientHost, ClientTickPreEvent,
-    EntityOutlineEvent, Flow, HostSide, InputKeyEvent, KeyAction, PlayerBreakSpeedEvent,
-    Registrar, RegistrationContext, RenderFogEvent, RenderFramePreEvent, RenderGuiPostEvent,
-    RenderLivingPostEvent, RenderNameTagEvent, RenderPlayerPreEvent, ScreenCharTypedPreEvent,
-    ScreenClosingEvent, ScreenKeyPressedPreEvent, ScreenMouseButtonPressedPreEvent,
-    ScreenMouseButtonReleasedPreEvent, ScreenMouseDraggedPreEvent, ScreenMouseScrolledPreEvent,
-    ScreenRenderPostEvent, SettingSpec, SubmitCustomGeometryEvent, Zoom, ZoomEvent,
+    EntityOutlineEvent, Flow, HostSide, InputKeyEvent, KeyAction, MouseButtonPreEvent,
+    PlayerBreakSpeedEvent, Registrar, RegistrationContext, RenderFogEvent, RenderFramePreEvent,
+    RenderGuiPostEvent, RenderLivingPostEvent, RenderNameTagEvent, RenderPlayerPreEvent,
+    ScreenCharTypedPreEvent, ScreenClosingEvent, ScreenKeyPressedPreEvent,
+    ScreenMouseButtonPressedPreEvent, ScreenMouseButtonReleasedPreEvent,
+    ScreenMouseDraggedPreEvent, ScreenMouseScrolledPreEvent, ScreenRenderPostEvent, SettingSpec,
+    SubmitCustomGeometryEvent, Zoom, ZoomEvent,
 };
 
 use crate::gui::ClickGuiState;
@@ -68,6 +69,53 @@ fn mod_active(host: &dyn ClientHost) -> bool {
     host.on(MOD_ID) && host.setting_bool("enabled").unwrap_or(true)
 }
 
+enum BindAction {
+    None,
+    OpenGui,
+    CloseGui,
+}
+
+fn handle_bind_press(host: &mut dyn ClientHost, key: &str) {
+    let action = {
+        let mut st = lock_state();
+        if !st.manager.config_loaded {
+            config::load(host, &mut st.manager);
+        }
+
+        let own_screen = host.mod_screen() == Some(MOD_ID);
+        if own_screen && st.gui.is_listening() {
+            BindAction::None
+        } else {
+            let configured_key = st.manager.gui_key().unwrap_or(DEFAULT_GUI_KEY);
+            if configured_key == key {
+                if own_screen {
+                    BindAction::CloseGui
+                } else if host.playing() {
+                    BindAction::OpenGui
+                } else {
+                    BindAction::None
+                }
+            } else if host.playing() {
+                st.manager.trigger_keybind(key);
+                config::save(host, &mut st.manager);
+                BindAction::None
+            } else {
+                BindAction::None
+            }
+        }
+    };
+
+    match action {
+        BindAction::OpenGui => {
+            let _ = host.mod_screen_open(MOD_ID);
+        }
+        BindAction::CloseGui => {
+            host.mod_screen_close(MOD_ID);
+        }
+        BindAction::None => {}
+    }
+}
+
 #[derive(Default)]
 struct Mod;
 
@@ -92,53 +140,26 @@ impl mod_api::Hooks for Mod {
         if !mod_active(host) || event.action != KeyAction::Press {
             return;
         }
+        handle_bind_press(host, event.key);
+    }
 
-        enum Action {
-            None,
-            OpenGui,
-            CloseGui,
+    fn mouse_button_pre(
+        &self,
+        host: &mut dyn ClientHost,
+        event: &mut MouseButtonPreEvent,
+    ) -> Flow {
+        if !mod_active(host) || !event.pressed || event.cancelled {
+            return Flow::Continue;
         }
-
-        let action = {
-            let mut st = lock_state();
-            if !st.manager.config_loaded {
-                config::load(host, &mut st.manager);
-            }
-
-            let own_screen = host.mod_screen() == Some(MOD_ID);
-            if own_screen && st.gui.is_listening() {
-                Action::None
-            } else {
-                let configured_key = st.manager.gui_key().unwrap_or(DEFAULT_GUI_KEY);
-                let is_gui_key = configured_key == event.key;
-
-                if is_gui_key {
-                    if own_screen {
-                        Action::CloseGui
-                    } else if host.playing() {
-                        Action::OpenGui
-                    } else {
-                        Action::None
-                    }
-                } else if host.playing() {
-                    st.manager.trigger_keybind(event.key);
-                    config::save(host, &mut st.manager);
-                    Action::None
-                } else {
-                    Action::None
-                }
-            }
+        // ClickGUI already captures mouse through screen_* hooks while open.
+        if host.mod_screen() == Some(MOD_ID) {
+            return Flow::Continue;
+        }
+        let Some(key) = settings::mouse_button_key(event.button) else {
+            return Flow::Continue;
         };
-
-        match action {
-            Action::OpenGui => {
-                let _ = host.mod_screen_open(MOD_ID);
-            }
-            Action::CloseGui => {
-                host.mod_screen_close(MOD_ID);
-            }
-            Action::None => {}
-        }
+        handle_bind_press(host, key);
+        Flow::Continue
     }
 
     fn client_tick_pre(&self, host: &mut dyn ClientHost, _: &mut ClientTickPreEvent) {
@@ -208,6 +229,9 @@ impl mod_api::Hooks for Mod {
         }
         let st = lock_state();
         visuals::render_world_geometry(host, event.view, event.draw, &st.manager, &st.interp);
+        let aim = st.manager.get(ModuleId::AimAssist);
+        let theme = theme::Theme::from_manager(&st.manager, host.millis());
+        aim_assist::render_range_circle(host, event.draw, aim, theme.accent);
     }
 
     fn render_player_pre(

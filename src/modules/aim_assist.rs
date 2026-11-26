@@ -5,11 +5,14 @@
 //! activation conditions, line-of-sight filtering, smoothing, deadzone, and
 //! movement prediction.
 
-use mod_api::{ClientHost, ClipBlock, ClipFluid, EntityRef, Hand};
+use mod_api::{
+    ClientHost, ClipBlock, ClipFluid, EntityRef, Hand, WorldDepth, WorldDrawContext, WorldLine,
+};
 
 use crate::entity_filter::{EntityFilter, pretty_entity_id};
 use crate::module::{Category, Module, ModuleId};
 use crate::settings::Setting;
+use crate::theme::with_alpha;
 
 /// Snapshot of the currently tracked target for HUD display.
 #[derive(Clone, Debug)]
@@ -19,6 +22,8 @@ pub struct AimTargetInfo {
     pub angle_deg: f32,
     pub health: Option<f32>,
     pub max_health: Option<f32>,
+    /// Tab-list latency in ms when known (players only); negative / None when unknown.
+    pub ping_ms: Option<i32>,
     pub aim_point: [f64; 3],
 }
 
@@ -160,9 +165,45 @@ pub fn build_module() -> Module {
             )
             .group("Visuals"),
             Setting::bool(
+                "hud_name",
+                "HUD Name",
+                "Show the target's name in the Target HUD.",
+                true,
+            ),
+            Setting::bool(
+                "hud_health",
+                "HUD Health",
+                "Show the target's health bar in the Target HUD.",
+                true,
+            ),
+            Setting::bool(
+                "hud_distance",
+                "HUD Distance",
+                "Show distance to the target in the Target HUD.",
+                true,
+            ),
+            Setting::bool(
+                "hud_angle",
+                "HUD Angle",
+                "Show angular offset to the target in the Target HUD.",
+                true,
+            ),
+            Setting::bool(
+                "hud_ping",
+                "HUD Ping",
+                "Show the target's tab-list ping (players) in the Target HUD.",
+                true,
+            ),
+            Setting::bool(
                 "show_fov_circle",
                 "FOV Indicator",
-                "Draw a subtle ring around the crosshair representing the Aim Assist FOV.",
+                "Draw a ring around the crosshair sized to the Aim Assist FOV vs your camera FOV.",
+                false,
+            ),
+            Setting::bool(
+                "show_range_circle",
+                "Range Circle",
+                "Draw a circle on the ground showing the Aim Assist range.",
                 false,
             ),
         ],
@@ -252,6 +293,7 @@ pub fn step(
         Some(living) => (living.health(host), living.max_health(host)),
         None => (None, None),
     };
+    let ping_ms = lookup_ping(host, &name);
 
     Some(AimTargetInfo {
         name,
@@ -259,8 +301,18 @@ pub fn step(
         angle_deg,
         health,
         max_health,
+        ping_ms,
         aim_point: point,
     })
+}
+
+fn lookup_ping(host: &dyn ClientHost, name: &str) -> Option<i32> {
+    let tab = host.client_session().client_tab_list()?;
+    tab.entries
+        .iter()
+        .find(|e| e.name.eq_ignore_ascii_case(name))
+        .map(|e| e.latency)
+        .filter(|&ms| ms >= 0)
 }
 
 struct TargetFilter<'a> {
@@ -521,6 +573,50 @@ pub fn dist(a: [f64; 3], b: [f64; 3]) -> f64 {
     let dy = a[1] - b[1];
     let dz = a[2] - b[2];
     (dx * dx + dy * dy + dz * dz).sqrt()
+}
+
+/// Draws a flat range circle on the ground under the local player for Aim Assist's range setting.
+pub fn render_range_circle(
+    host: &dyn ClientHost,
+    draw: &mut dyn WorldDrawContext,
+    module: &Module,
+    accent: u32,
+) {
+    if !module.enabled || !module.bool("show_range_circle", false) || !host.playing() {
+        return;
+    }
+    let Some(player) = host.camera_entity() else {
+        return;
+    };
+    let Some(feet) = player.position(host) else {
+        return;
+    };
+    let range = module.float("range", 4.5).clamp(0.5, 32.0);
+    let y = feet[1] + 0.05;
+    let segments = 48usize;
+    let usage = draw.usage();
+    let budget = usage.line_capacity.saturating_sub(usage.lines) as usize;
+    if budget < segments {
+        return;
+    }
+
+    let mut lines = Vec::with_capacity(segments);
+    let color = with_alpha(accent, 0xB0);
+    let width = 1.6_f32;
+    for i in 0..segments {
+        let a0 = (i as f64 / segments as f64) * std::f64::consts::TAU;
+        let a1 = ((i + 1) as f64 / segments as f64) * std::f64::consts::TAU;
+        let (s0, c0) = a0.sin_cos();
+        let (s1, c1) = a1.sin_cos();
+        lines.push(WorldLine::new(
+            [feet[0] + c0 * range, y, feet[2] + s0 * range],
+            [feet[0] + c1 * range, y, feet[2] + s1 * range],
+            color,
+            width,
+            WorldDepth::ThroughWalls,
+        ));
+    }
+    let _ = draw.lines(&lines);
 }
 
 #[cfg(test)]

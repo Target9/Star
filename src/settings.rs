@@ -546,11 +546,20 @@ fn decimals_for_step(step: f64) -> usize {
     }
 }
 
-/// Converts a vanilla GLFW key identifier (`key.keyboard.right.shift`) into a compact label (`RSHIFT`).
+/// Converts a vanilla GLFW key / mouse identifier into a compact label
+/// (`key.keyboard.right.shift` → `RSHIFT`, `key.mouse.left` → `LMB`).
 pub fn format_key_name(key: Option<&str>) -> String {
     let Some(key) = key else {
         return "NONE".to_owned();
     };
+    if let Some(mouse) = key.strip_prefix("key.mouse.") {
+        return match mouse {
+            "left" => "LMB".into(),
+            "right" => "RMB".into(),
+            "middle" => "MMB".into(),
+            other => format!("M{}", other.to_ascii_uppercase()),
+        };
+    }
     let tail = key.strip_prefix("key.keyboard.").unwrap_or(key);
     match tail {
         "right.shift" => "RSHIFT".into(),
@@ -569,5 +578,20 @@ pub fn format_key_name(key: Option<&str>) -> String {
         "insert" => "INS".into(),
         "caps.lock" => "CAPS".into(),
         other => other.replace('.', "_").to_ascii_uppercase(),
+    }
+}
+
+/// Maps a GLFW mouse button index to Minecraft's `key.mouse.*` id.
+pub fn mouse_button_key(button: i32) -> Option<&'static str> {
+    match button {
+        0 => Some("key.mouse.left"),
+        1 => Some("key.mouse.right"),
+        2 => Some("key.mouse.middle"),
+        3 => Some("key.mouse.4"),
+        4 => Some("key.mouse.5"),
+        5 => Some("key.mouse.6"),
+        6 => Some("key.mouse.7"),
+        7 => Some("key.mouse.8"),
+        _ => None,
     }
 }

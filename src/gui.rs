@@ -374,7 +374,7 @@ impl ClickGuiState {
 
         // Brand title on left
         let title = "STAR";
-        let ver = "v0.2.5";
+        let ver = "v0.2.6";
         let ty = font.center_y(0.0, TOP_BAR_H - 1.0);
         font.draw_header(draw, title, [10.0, ty], theme.accent);
         let title_w = font.width(draw, title, font.bold_headers);
@@ -984,7 +984,10 @@ impl ClickGuiState {
                 if hover {
                     draw.fill(bind_rect, theme.module_hover);
                     self.hovered_tooltip =
-                        Some("Click to assign a toggle keybind (ESC/Backspace to clear).".into());
+                        Some(
+                            "Click to assign a toggle keybind. Press a key or mouse button; ESC/Backspace/RMB clears."
+                                .into(),
+                        );
                 }
                 let listening = self.listening_bind == Some(BindTarget::Module(mod_idx));
                 let val_str = if listening {
@@ -1942,7 +1945,7 @@ impl ClickGuiState {
         let hint = if self.entity_picker.is_some() {
             "Click entities to toggle  |  Scroll to browse  |  ESC Close Picker"
         } else if self.listening_bind.is_some() {
-            "Press any key to bind  |  ESC or Backspace to clear"
+            "Press any key or mouse button to bind  |  ESC / Backspace / RMB clear"
         } else if self.active_tab == GuiTab::Modules {
             "LMB Toggle  |  RMB Settings / Reset  |  MMB Bind  |  Scroll Adjust  |  ESC Close"
         } else {
@@ -1995,6 +1998,17 @@ impl ClickGuiState {
         self.search_focused = false;
         if let Some(p) = &mut self.entity_picker {
             p.search_focused = false;
+        }
+
+        // While capturing a keybind, mouse buttons assign (or clear with RMB).
+        if self.listening_bind.is_some() {
+            if button == 1 {
+                return self.key_pressed("key.keyboard.escape", manager);
+            }
+            if let Some(key) = crate::settings::mouse_button_key(button) {
+                return self.key_pressed(key, manager);
+            }
+            return true;
         }
 
         // Hit-test topmost element first
