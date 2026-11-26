@@ -1306,7 +1306,7 @@ impl ClickGuiState {
                 VisSection::Screen => ("Screen", "Vignette, wash, scanlines and hit flash.", false),
                 VisSection::Hit => ("Hit FX", "Particle bursts when you land a hit.", true),
                 VisSection::Ambient => ("Ambient", "Floating particles around you.", false),
-                VisSection::Trip => ("Trip", "LSD-style effects scaled by Dose.", false),
+                VisSection::Trip => ("Trip", "Morph, kaleidoscope & wash scaled by Dose.", false),
                 VisSection::Presets => unreachable!(),
             };
             // Leave room for the section pills.

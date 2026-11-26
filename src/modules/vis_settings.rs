@@ -215,7 +215,7 @@ pub fn build_world_module() -> Module {
                 "Saturation",
                 "How vivid biome overrides are.",
                 0.0,
-                1.5,
+                2.0,
                 0.05,
                 1.0,
             )
@@ -310,7 +310,7 @@ pub fn build_camera_module() -> Module {
                 "Idle Sway",
                 "Gentle camera bob while standing still.",
                 0.0,
-                2.0,
+                4.0,
                 0.05,
                 0.0,
             )
@@ -320,7 +320,7 @@ pub fn build_camera_module() -> Module {
                 "Roll Amount",
                 "Degrees of camera roll drift.",
                 0.0,
-                18.0,
+                28.0,
                 0.5,
                 0.0,
             )
@@ -371,7 +371,7 @@ pub fn build_screen_module() -> Module {
                 "Colour Wash",
                 "Full-screen tint strength.",
                 0.0,
-                0.55,
+                0.75,
                 0.05,
                 0.0,
             ),
@@ -411,7 +411,7 @@ pub fn build_screen_module() -> Module {
                 "Chroma Bars",
                 "Fake chromatic aberration bars on the left / right edges.",
                 0.0,
-                0.5,
+                0.85,
                 0.05,
                 0.0,
             ),
@@ -547,7 +547,7 @@ pub fn build_ambient_module() -> Module {
                 "Density",
                 "How many ambient particles spawn per second.",
                 0.0,
-                24.0,
+                36.0,
                 0.5,
                 4.0,
             )
@@ -631,6 +631,18 @@ pub fn build_trip_module() -> Module {
                 true,
             ),
             Setting::bool(
+                "morph",
+                "World Morph",
+                "Melting camera breathe, harmonic roll, and flowing screen waves.",
+                true,
+            ),
+            Setting::bool(
+                "kaleidoscope",
+                "Kaleidoscope",
+                "Expanding rainbow rings and sector colour flashes.",
+                true,
+            ),
+            Setting::bool(
                 "particles",
                 "Trip Particles",
                 "Drifting sparkles and visual snow.",
@@ -653,7 +665,7 @@ pub fn build_trip_module() -> Module {
                 "Effect Strength",
                 "Extra multiplier on top of Dose for trip-only effects.",
                 0.25,
-                2.0,
+                2.5,
                 0.05,
                 1.0,
             )

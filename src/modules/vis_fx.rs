@@ -237,15 +237,35 @@ pub fn on_tick(
 
     let world = manager.get(ModuleId::VisWorld);
     let trip = manager.get(ModuleId::VisTrip);
+    let rainbow_trip = fx.trip_level > 0.05 && trip.bool("rainbow_biomes", true);
     let want_tint = world.bool("tint_biomes", false)
-        || (fx.trip_level > 0.05 && trip.bool("rainbow_biomes", true));
+        || world.bool("rainbow_biomes", false)
+        || rainbow_trip;
     let sig = biome_signature(manager, fx.trip_level);
+    // Rainbow biomes must keep refreshing or the world freezes on one hue.
+    let rainbow_period_ms = if rainbow_trip {
+        (420.0 / (0.65 + fx.trip_level * trip.float("strength", 1.0) as f32)).clamp(220.0, 900.0) as u64
+    } else if world.bool("rainbow_biomes", false) {
+        1_200
+    } else {
+        BIOME_REFRESH_MIN_MS
+    };
+    if rainbow_trip || world.bool("rainbow_biomes", false) {
+        if now.saturating_sub(fx.last_biome_refresh_ms) >= rainbow_period_ms {
+            fx.need_biome_refresh = true;
+        }
+    }
     if !want_tint {
         fx.need_biome_refresh = false;
         fx.last_biome_sig = sig;
     } else if sig != fx.last_biome_sig || fx.need_biome_refresh {
         // Ask the caller to refresh after the STATE lock is dropped.
-        if now.saturating_sub(fx.last_biome_refresh_ms) >= BIOME_REFRESH_MIN_MS {
+        let min_gap = if rainbow_trip || world.bool("rainbow_biomes", false) {
+            rainbow_period_ms
+        } else {
+            BIOME_REFRESH_MIN_MS
+        };
+        if now.saturating_sub(fx.last_biome_refresh_ms) >= min_gap {
             out.refresh_biomes = true;
             fx.last_biome_sig = sig;
             fx.last_biome_refresh_ms = now;
@@ -307,6 +327,21 @@ fn wave(now_ms: u64, period_s: f32) -> f32 {
     let p = period_s.max(0.5);
     let t = (now_ms as f32 / 1000.0) / p;
     (t * std::f32::consts::TAU).sin() * 0.5 + 0.5
+}
+
+/// Signed multi-harmonic melt wave in [-1, 1] — feels like the world breathing.
+fn morph_wave(now_ms: u64, period_s: f32) -> f32 {
+    let t = now_ms as f32 / 1000.0;
+    let p = period_s.max(0.4);
+    let a = ((t / p) * std::f32::consts::TAU).sin();
+    let b = ((t / (p * 0.37)) * std::f32::consts::TAU).sin() * 0.55;
+    let c = ((t / (p * 0.19)) * std::f32::consts::TAU).sin() * 0.28;
+    (a + b + c) / 1.83
+}
+
+fn trip_hue(time_ms: u64, offset: f32, speed: f32) -> u32 {
+    let hue = ((time_ms as f32 * speed * 0.001) + offset).rem_euclid(1.0);
+    hsv_to_argb(hue, 0.92, 1.0, 0xFF)
 }
 
 fn emit_hits(
@@ -589,7 +624,8 @@ pub fn apply_fog_color(
     let accent = resolve_accent(manager, theme, time_ms, w);
     let rgb = argb_to_rgb01(accent);
     let strength = if fx.trip_level > 0.05 && trip.bool("rainbow_sky", true) {
-        (0.35 + fx.trip_level * 0.55).clamp(0.0, 1.0)
+        let boost = trip.float("strength", 1.0) as f32;
+        (0.45 + fx.trip_level * 0.7 * boost).clamp(0.0, 1.0)
     } else {
         0.55
     };
@@ -667,9 +703,16 @@ pub fn apply_fov(
     if fx.trip_level > 0.05 && trip.bool("fov_breathe", true) {
         let period = trip.float("wave_period", 12.0) as f32;
         let strength = trip.float("strength", 1.0) as f32;
+        let dose = fx.trip_level * strength;
+        let morph_on = trip.bool("morph", true);
         let slow = (wave(time_ms, period) - 0.5) * 2.0;
-        let heart = ((time_ms as f32 / 1000.0) * 1.35 * std::f32::consts::TAU).sin();
-        degrees += slow * 8.0 * fx.trip_level * strength + heart * 1.2 * fx.trip_level;
+        let heart = ((time_ms as f32 / 1000.0) * 1.55 * std::f32::consts::TAU).sin();
+        degrees += slow * 10.0 * dose + heart * 2.0 * dose;
+        if morph_on {
+            let melt = morph_wave(time_ms, period);
+            let flutter = ((time_ms as f32 / 1000.0) * 3.1 * std::f32::consts::TAU).sin();
+            degrees += melt * 16.0 * dose + flutter * 3.5 * dose;
+        }
     }
     event.degrees = degrees.clamp(1.0, 179.0);
 }
@@ -689,16 +732,21 @@ pub fn apply_roll(
     if fx.trip_level > 0.05 && trip.bool("roll_drift", true) {
         let period = trip.float("wave_period", 12.0) as f32;
         let strength = trip.float("strength", 1.0) as f32;
-        roll += (wave(time_ms, period) - 0.5)
-            * 2.0
-            * 12.0
-            * fx.trip_level
-            * strength;
+        let dose = fx.trip_level * strength;
+        roll += (wave(time_ms, period) - 0.5) * 2.0 * 16.0 * dose;
+        if trip.bool("morph", true) {
+            let melt = morph_wave(time_ms, period * 0.72);
+            let spin = ((time_ms as f32 / 1000.0) * 0.55 * std::f32::consts::TAU).sin();
+            roll += melt * 22.0 * dose + spin * 6.0 * dose;
+        }
     }
     let sway = cam.float("sway", 0.0) as f32;
     if sway > 0.01 {
         let t = time_ms as f32 / 1000.0;
         roll += (t * 0.7).sin() * sway;
+        if fx.trip_level > 0.05 && trip.bool("morph", true) {
+            roll += (t * 1.9).sin() * sway * 0.85 * fx.trip_level;
+        }
     }
     if roll.is_finite() {
         event.roll = (event.roll + roll).rem_euclid(360.0);
@@ -723,11 +771,23 @@ pub fn apply_shake(
         // Still allow our intentional punch through a tiny offset.
     }
     let cam = manager.get(ModuleId::VisCamera);
+    let trip = manager.get(ModuleId::VisTrip);
     let sway = cam.float("sway", 0.0) as f32;
     if sway > 0.01 {
         let t = time_ms as f32 / 1000.0;
         event.shake.pitch += (t * 1.1).sin() * sway * 0.35;
         event.shake.yaw += (t * 0.9).cos() * sway * 0.25;
+    }
+    if fx.trip_level > 0.05 && trip.bool("morph", true) {
+        let period = trip.float("wave_period", 12.0) as f32;
+        let strength = trip.float("strength", 1.0) as f32;
+        let dose = fx.trip_level * strength;
+        let melt = morph_wave(time_ms, period);
+        let t = time_ms as f32 / 1000.0;
+        event.shake.pitch += melt * 1.8 * dose + (t * 2.4).sin() * 0.55 * dose;
+        event.shake.yaw += morph_wave(time_ms, period * 1.27) * 1.5 * dose
+            + (t * 1.7).cos() * 0.45 * dose;
+        event.shake.roll += melt * 2.2 * dose;
     }
     if fx.punch_yaw.abs() > 0.01 || fx.punch_pitch.abs() > 0.01 {
         event.shake.yaw += fx.punch_yaw;
@@ -754,10 +814,11 @@ pub fn apply_biome_colors(
     let sat = world.float("saturation", 1.0) as f32;
     let (grass, foliage, water) = if rainbow {
         let hash = fnv1a(event.biome);
-        let base = ((time_ms as f32 * 0.02) + (hash as f32) * 0.0000001) % 1.0;
-        let g = hsv_to_argb(base, (0.65 * sat).clamp(0.0, 1.0), 0.85, 0xFF);
-        let f = hsv_to_argb((base + 0.12) % 1.0, (0.7 * sat).clamp(0.0, 1.0), 0.8, 0xFF);
-        let w = hsv_to_argb((base + 0.55) % 1.0, (0.55 * sat).clamp(0.0, 1.0), 0.9, 0xFF);
+        let speed = if fx.trip_level > 0.05 { 0.085 } else { 0.02 };
+        let base = ((time_ms as f32 * speed) + (hash as f32) * 0.0000001).rem_euclid(1.0);
+        let g = hsv_to_argb(base, (0.78 * sat).clamp(0.0, 1.0), 0.95, 0xFF);
+        let f = hsv_to_argb((base + 0.18) % 1.0, (0.82 * sat).clamp(0.0, 1.0), 0.9, 0xFF);
+        let w = hsv_to_argb((base + 0.55) % 1.0, (0.7 * sat).clamp(0.0, 1.0), 1.0, 0xFF);
         (g, f, w)
     } else {
         (
@@ -844,19 +905,22 @@ pub fn apply_shader_params(
     let w = wave(time_ms, period);
     let strength = trip.float("strength", 1.0) as f32;
     let dose = fx.trip_level * strength;
+    let morph = if trip.bool("morph", true) { 1.0 } else { 0.55 };
+    let kaleido = if trip.bool("kaleidoscope", true) { 1.0 } else { 0.4 };
+    let melt = morph_wave(time_ms, period);
     // Slot 0: dose, phase, warp, chroma
     event.params[0] = [
         dose,
-        w,
-        dose * 0.65,
-        dose * 0.45,
+        (w + melt * 0.35).clamp(0.0, 1.0),
+        dose * 1.15 * morph,
+        dose * 0.85 * morph,
     ];
     // Slot 1: hue shift, saturation, bloom, kaleidoscope
     event.params[1] = [
-        (time_ms as f32 * 0.00015 * (1.0 + dose)).fract(),
-        1.0 + dose * 0.8,
-        dose * 0.55,
-        dose * 0.35,
+        (time_ms as f32 * 0.00035 * (1.0 + dose * 1.5)).fract(),
+        1.0 + dose * 1.35,
+        dose * 0.95,
+        dose * 0.85 * kaleido,
     ];
 }
 
@@ -974,74 +1038,148 @@ pub fn draw_screen_overlays(
     let accent = resolve_accent(manager, theme, time_ms, wave(time_ms, 9.0));
     let period = trip.float("wave_period", 12.0) as f32;
     let wv = wave(time_ms, period);
+    let strength = trip.float("strength", 1.0) as f32;
+    let dose = fx.trip_level * strength;
+    let tripping = dose > 0.05;
 
     let mut vignette = screen.float("vignette", 0.0) as f32;
-    if screen.bool("vignette_pulse", false) || (fx.trip_level > 0.05 && trip.bool("colour_wash", true))
-    {
-        vignette *= 0.7 + wv * 0.6;
+    if screen.bool("vignette_pulse", false) || (tripping && trip.bool("colour_wash", true)) {
+        vignette *= 0.55 + wv * 0.75;
+        if tripping && trip.bool("morph", true) {
+            vignette *= 0.85 + morph_wave(time_ms, period * 0.6).abs() * 0.45;
+        }
     }
     if vignette > 0.01 {
-        let bands = 6;
+        let bands = if tripping { 9 } else { 6 };
         for i in 0..bands {
             let t = (i as f32 + 1.0) / bands as f32;
-            let a = ((vignette * t * t * 160.0) as u32).min(200);
-            let inset = (1.0 - t) * 0.08;
-            let color = with_alpha(0xFF00_0000, a as u8);
-            // top / bottom / left / right strips
+            let a = ((vignette * t * t * 175.0) as u32).min(210);
+            let breathe = if tripping {
+                1.0 + morph_wave(time_ms + (i as u64) * 90, period).abs() * 0.35
+            } else {
+                1.0
+            };
+            let inset = (1.0 - t) * 0.10 * breathe;
             let bw = w * inset.max(0.01);
             let bh = h * inset.max(0.01);
-            draw.fill([0.0, 0.0, w, bh], color);
-            draw.fill([0.0, h - bh, w, bh], color);
-            draw.fill([0.0, 0.0, bw, h], color);
-            draw.fill([w - bw, 0.0, bw, h], color);
+            // Dark edge always; rainbow tint on top while tripping.
+            let dark = with_alpha(0xFF00_0000, a as u8);
+            draw.fill([0.0, 0.0, w, bh], dark);
+            draw.fill([0.0, h - bh, w, bh], dark);
+            draw.fill([0.0, 0.0, bw, h], dark);
+            draw.fill([w - bw, 0.0, bw, h], dark);
+            if tripping {
+                let tint = with_alpha(trip_hue(time_ms, t * 0.2, 0.18), (a as f32 * 0.45) as u8);
+                draw.fill([0.0, 0.0, w, bh], tint);
+                draw.fill([0.0, h - bh, w, bh], tint);
+                draw.fill([0.0, 0.0, bw, h], tint);
+                draw.fill([w - bw, 0.0, bw, h], tint);
+            }
         }
     }
 
+    // Multi-layer rainbow wash — primary + delayed afterimage hues.
     let mut wash = screen.float("wash", 0.0) as f32;
-    if fx.trip_level > 0.05 && trip.bool("colour_wash", true) {
-        wash = (wash + fx.trip_level * 0.18 * trip.float("strength", 1.0) as f32).min(0.55);
+    if tripping && trip.bool("colour_wash", true) {
+        wash = (wash + dose * 0.32).min(0.72);
     }
     if wash > 0.01 {
-        let a = (wash * 180.0) as u8;
-        draw.fill([0.0, 0.0, w, h], with_alpha(accent, a));
+        if tripping && trip.bool("colour_wash", true) {
+            let layers = [
+                (0.0_f32, 1.0_f32),
+                (0.33, 0.55),
+                (0.66, 0.35),
+            ];
+            for (off, scale) in layers {
+                let col = trip_hue(time_ms, off, 0.22 + dose * 0.08);
+                let a = (wash * scale * 165.0) as u8;
+                draw.fill([0.0, 0.0, w, h], with_alpha(col, a));
+            }
+        } else {
+            let a = (wash * 180.0) as u8;
+            draw.fill([0.0, 0.0, w, h], with_alpha(accent, a));
+        }
+    }
+
+    // Melting horizontal / vertical colour waves.
+    if tripping && trip.bool("morph", true) {
+        draw_morph_waves(draw, w, h, time_ms, period, dose);
+    }
+
+    // Expanding rainbow rings + sector flashes.
+    if tripping && trip.bool("kaleidoscope", true) {
+        draw_kaleidoscope(draw, w, h, time_ms, period, dose);
     }
 
     let scan = screen.float("scanlines", 0.0) as f32;
     if scan > 0.01 {
-        let a = (scan * 90.0) as u8;
-        let step = 3.0;
-        let mut y = ((time_ms / 30) % 3) as f32;
+        let a = (scan * (if tripping { 110.0 } else { 90.0 })) as u8;
+        let step = if tripping { 2.5 } else { 3.0 };
+        let drift = if tripping {
+            morph_wave(time_ms, period * 0.4) * 4.0
+        } else {
+            0.0
+        };
+        let mut y = ((time_ms / 30) % 3) as f32 + drift;
         while y < h {
-            draw.fill([0.0, y, w, 1.0], with_alpha(0xFF00_0000, a));
+            let col = if tripping && ((y as i32) % 7 == 0) {
+                with_alpha(trip_hue(time_ms, y * 0.01, 0.15), (a as f32 * 0.7) as u8)
+            } else {
+                with_alpha(0xFF00_0000, a)
+            };
+            draw.fill([0.0, y, w, 1.0], col);
             y += step;
         }
     }
 
     let edge = screen.float("edge_glow", 0.0) as f32;
     if edge > 0.01 {
-        let a = (edge * 140.0) as u8;
-        let t = with_alpha(accent, a);
-        draw.fill_gradient([0.0, 0.0, w, 10.0], t, 0x0000_0000);
-        draw.fill_gradient([0.0, h - 10.0, w, 10.0], 0x0000_0000, t);
-        draw.fill([0.0, 0.0, 6.0, h], with_alpha(accent, (a as f32 * 0.7) as u8));
-        draw.fill([w - 6.0, 0.0, 6.0, h], with_alpha(accent, (a as f32 * 0.7) as u8));
+        let glow_col = if tripping {
+            trip_hue(time_ms, 0.15, 0.2)
+        } else {
+            accent
+        };
+        let a = (edge * 155.0) as u8;
+        let t = with_alpha(glow_col, a);
+        let thick = if tripping { 16.0 + dose * 10.0 } else { 10.0 };
+        draw.fill_gradient([0.0, 0.0, w, thick], t, 0x0000_0000);
+        draw.fill_gradient([0.0, h - thick, w, thick], 0x0000_0000, t);
+        draw.fill(
+            [0.0, 0.0, 8.0 + dose * 4.0, h],
+            with_alpha(glow_col, (a as f32 * 0.75) as u8),
+        );
+        draw.fill(
+            [w - (8.0 + dose * 4.0), 0.0, 8.0 + dose * 4.0, h],
+            with_alpha(glow_col, (a as f32 * 0.75) as u8),
+        );
     }
 
     let chroma = screen.float("chroma_bars", 0.0) as f32
-        + if fx.trip_level > 0.1 { fx.trip_level * 0.2 } else { 0.0 };
+        + if dose > 0.1 { dose * 0.35 } else { 0.0 };
     if chroma > 0.01 {
-        let a = (chroma.clamp(0.0, 0.6) * 160.0) as u8;
-        draw.fill([0.0, 0.0, 4.0, h], with_alpha(0xFFFF_0040, a));
-        draw.fill([w - 4.0, 0.0, 4.0, h], with_alpha(0xFF00_E0FF, a));
+        let a = (chroma.clamp(0.0, 0.85) * 180.0) as u8;
+        let spread = 4.0 + dose * 8.0;
+        draw.fill([0.0, 0.0, spread, h], with_alpha(0xFFFF_0040, a));
+        draw.fill([spread * 0.55, 0.0, spread * 0.45, h], with_alpha(0xFFFF_80FF, (a as f32 * 0.5) as u8));
+        draw.fill([w - spread, 0.0, spread, h], with_alpha(0xFF00_E0FF, a));
+        draw.fill(
+            [w - spread, 0.0, spread * 0.45, h],
+            with_alpha(0xFF40_FF80, (a as f32 * 0.5) as u8),
+        );
     }
 
     if time_ms < fx.hit_flash_until_ms {
         let remain = (fx.hit_flash_until_ms - time_ms) as f32 / 140.0;
-        let a = (remain.clamp(0.0, 1.0) * 120.0) as u8;
-        draw.fill([0.0, 0.0, w, 8.0], with_alpha(accent, a));
-        draw.fill([0.0, h - 8.0, w, 8.0], with_alpha(accent, a));
-        draw.fill([0.0, 0.0, 8.0, h], with_alpha(accent, a));
-        draw.fill([w - 8.0, 0.0, 8.0, h], with_alpha(accent, a));
+        let a = (remain.clamp(0.0, 1.0) * 140.0) as u8;
+        let flash = if tripping {
+            trip_hue(time_ms, 0.5, 0.4)
+        } else {
+            accent
+        };
+        draw.fill([0.0, 0.0, w, 10.0], with_alpha(flash, a));
+        draw.fill([0.0, h - 10.0, w, 10.0], with_alpha(flash, a));
+        draw.fill([0.0, 0.0, 10.0, h], with_alpha(flash, a));
+        draw.fill([w - 10.0, 0.0, 10.0, h], with_alpha(flash, a));
     }
 
     if screen.bool("low_hp_pulse", false) {
@@ -1060,6 +1198,94 @@ pub fn draw_screen_overlays(
                     }
                 }
             }
+        }
+    }
+}
+
+fn draw_morph_waves(
+    draw: &mut dyn mod_api::DrawContext,
+    w: f32,
+    h: f32,
+    time_ms: u64,
+    period: f32,
+    dose: f32,
+) {
+    let t = time_ms as f32 / 1000.0;
+    let melt = morph_wave(time_ms, period);
+    let band_h = (10.0 + dose * 8.0).clamp(8.0, 22.0);
+    let rows = ((h / (band_h * 2.2)) as i32).clamp(8, 18);
+    for i in 0..rows {
+        let phase = i as f32 * 0.37;
+        let y_base = (i as f32 / rows as f32) * h;
+        let wobble = ((t * (1.1 + dose * 0.4) + phase) * std::f32::consts::TAU).sin()
+            * (18.0 + dose * 28.0)
+            + melt * 12.0;
+        let y = (y_base + wobble).rem_euclid(h);
+        let thick = band_h * (0.55 + 0.45 * ((t * 2.0 + phase).sin().abs()));
+        let col = trip_hue(time_ms, phase * 0.13 + melt.abs() * 0.05, 0.25);
+        let a = ((28.0 + dose * 42.0) as u32).min(95) as u8;
+        draw.fill([0.0, y, w, thick], with_alpha(col, a));
+    }
+
+    let cols = ((w / 48.0) as i32).clamp(6, 14);
+    let band_w = (8.0 + dose * 6.0).clamp(6.0, 18.0);
+    for i in 0..cols {
+        let phase = i as f32 * 0.51;
+        let x_base = (i as f32 / cols as f32) * w;
+        let wobble = ((t * (0.9 + dose * 0.35) + phase) * std::f32::consts::TAU).cos()
+            * (14.0 + dose * 22.0);
+        let x = (x_base + wobble).rem_euclid(w);
+        let col = trip_hue(time_ms, 0.5 + phase * 0.09, 0.2);
+        let a = ((18.0 + dose * 30.0) as u32).min(70) as u8;
+        draw.fill([x, 0.0, band_w, h], with_alpha(col, a));
+    }
+}
+
+fn draw_kaleidoscope(
+    draw: &mut dyn mod_api::DrawContext,
+    w: f32,
+    h: f32,
+    time_ms: u64,
+    period: f32,
+    dose: f32,
+) {
+    let cx = w * 0.5;
+    let cy = h * 0.5;
+    let t = time_ms as f32 / 1000.0;
+    let pulse = morph_wave(time_ms, period * 0.85).abs();
+    let max_r = (w.max(h) * 0.55) * (0.75 + pulse * 0.45 + dose * 0.15);
+    let rings = 7;
+    for i in 0..rings {
+        let u = (i as f32 + 1.0) / rings as f32;
+        let breathe = 1.0 + ((t * 1.6 + u * 4.0).sin() * 0.12);
+        let r = max_r * u * breathe;
+        let thickness = (3.0 + dose * 3.5 + (1.0 - u) * 4.0).clamp(2.0, 10.0);
+        let col = trip_hue(time_ms, u * 0.45 + t * 0.05, 0.3);
+        let a = ((40.0 + dose * 55.0) * (1.0 - u * 0.35)) as u8;
+        // Approximate a ring with four edge strips of a square frame.
+        let x = cx - r;
+        let y = cy - r;
+        let side = r * 2.0;
+        draw.fill([x, y, side, thickness], with_alpha(col, a));
+        draw.fill([x, y + side - thickness, side, thickness], with_alpha(col, a));
+        draw.fill([x, y, thickness, side], with_alpha(col, a));
+        draw.fill([x + side - thickness, y, thickness, side], with_alpha(col, a));
+    }
+
+    // Rotating sector wedges (axis-aligned strips that sweep across).
+    let sectors = 8;
+    for i in 0..sectors {
+        let ang = t * (0.7 + dose * 0.4) + (i as f32) * (std::f32::consts::TAU / sectors as f32);
+        let span = 0.18 + dose * 0.06;
+        let along_x = ang.cos().abs() > ang.sin().abs();
+        let col = trip_hue(time_ms, i as f32 / sectors as f32, 0.28);
+        let a = ((22.0 + dose * 38.0) as u32).min(80) as u8;
+        if along_x {
+            let x = (cx + ang.cos() * w * 0.35 - w * span * 0.5).clamp(0.0, w);
+            draw.fill([x, 0.0, w * span * 0.35, h], with_alpha(col, a));
+        } else {
+            let y = (cy + ang.sin() * h * 0.35 - h * span * 0.5).clamp(0.0, h);
+            draw.fill([0.0, y, w, h * span * 0.35], with_alpha(col, a));
         }
     }
 }
@@ -1143,6 +1369,14 @@ mod tests {
         for ms in [0_u64, 500, 12_000, 90_000] {
             let w = wave(ms, 12.0);
             assert!((0.0..=1.0).contains(&w));
+        }
+    }
+
+    #[test]
+    fn morph_wave_stays_signed_unit() {
+        for ms in [0_u64, 250, 4_000, 33_000] {
+            let m = morph_wave(ms, 5.5);
+            assert!((-1.05..=1.05).contains(&m), "morph_wave={m}");
         }
     }
 }
