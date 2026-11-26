@@ -2188,7 +2188,7 @@ impl ClickGuiState {
         } else if self.listening_bind.is_some() {
             "Press any key or mouse button to bind  |  ESC / Backspace / RMB clear"
         } else if self.active_tab == GuiTab::Modules {
-            "LMB Toggle  |  RMB Settings / Reset  |  MMB Bind  |  Scroll Adjust  |  ESC Close"
+            "LMB Toggle  |  RMB Settings / Reset  |  MMB Bind  |  Scroll Panels  |  Shift+Scroll Slider  |  ESC Close"
         } else if self.active_tab == GuiTab::Profiles {
             "Create, load, and save profiles  |  Copy / Paste shares a config  |  ESC Close"
         } else if self.active_tab == GuiTab::Hud {
@@ -3298,17 +3298,18 @@ impl ClickGuiState {
             return true;
         }
 
-        // Fine-adjust slider when hovering directly over one
-        if let Some(hit) = self
-            .hits
-            .iter()
-            .rev()
-            .find(|h| rect_contains(h.rect, mouse))
+        // Plain scrolling always scrolls the page. Only Shift+scroll over a slider adjusts it,
+        // so scrolling past a slider never changes its value by accident.
+        if (modifiers & 1) != 0
+            && let Some(hit) = self
+                .hits
+                .iter()
+                .rev()
+                .find(|h| rect_contains(h.rect, mouse))
             && let HitKind::SettingSlider { mod_idx, set_idx } = hit.kind
         {
-            let mult = if (modifiers & 1) != 0 { 5 } else { 1 };
             let dir = if scroll_y > 0.0 { 1 } else { -1 };
-            if manager.modules[mod_idx].settings[set_idx].nudge(dir * mult) {
+            if manager.modules[mod_idx].settings[set_idx].nudge(dir) {
                 manager.dirty = true;
                 return true;
             }

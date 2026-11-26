@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, HashSet};
 
 use crate::entity_filter::EntityFilter;
-use crate::font::FONT_PRESETS;
+use crate::font::{DEFAULT_FONT_INDEX, FONT_PRESETS};
 use crate::modules::{aim_assist, extras, fast_mine, movement, visuals};
 use crate::settings::Setting;
 use crate::theme::THEME_PRESETS;
@@ -85,6 +85,7 @@ impl Category {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ModuleId {
     AimAssist,
+    AimVisuals,
     FastMine,
     Esp,
     Tracers,
@@ -107,8 +108,9 @@ pub enum ModuleId {
 
 impl ModuleId {
     /// Every module id, in registration order.
-    pub const ALL: [ModuleId; 19] = [
+    pub const ALL: [ModuleId; 20] = [
         ModuleId::AimAssist,
+        ModuleId::AimVisuals,
         ModuleId::FastMine,
         ModuleId::Esp,
         ModuleId::Tracers,
@@ -253,7 +255,8 @@ impl Module {
             ModuleId::DamageIndicators => Some(format!("{:.0}m", self.float("range", 32.0))),
             ModuleId::Radar => Some(format!("{:.0}m", self.float("range", 48.0))),
             ModuleId::Sprint => Some(self.mode_str("mode", "Forward").to_owned()),
-            ModuleId::NoFog
+            ModuleId::AimVisuals
+            | ModuleId::NoFog
             | ModuleId::Camera
             | ModuleId::ToggleSneak
             | ModuleId::AutoWalk
@@ -313,6 +316,7 @@ impl ModuleManager {
     pub fn new() -> Self {
         let modules = vec![
             aim_assist::build_module(),
+            aim_assist::build_visuals_module(),
             fast_mine::build_module(),
             visuals::build_esp_module(),
             visuals::build_tracers_module(),
@@ -582,7 +586,7 @@ fn build_click_gui_module() -> Module {
                 "Font",
                 "Font style used across Star's ClickGUI, modals, HUD, and Nametags.",
                 FONT_PRESETS,
-                0,
+                DEFAULT_FONT_INDEX,
             )
             .group("Font & Typography"),
             Setting::float(

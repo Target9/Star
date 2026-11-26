@@ -25,6 +25,9 @@ pub const FONT_PRESETS: &[&str] = &[
     "Minecraft",
 ];
 
+/// Index into [`FONT_PRESETS`] of the font used until the player picks another (Minecraft).
+pub const DEFAULT_FONT_INDEX: usize = 9;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FontFace {
     JetBrainsMono,
@@ -52,7 +55,7 @@ impl FontFace {
             7 => Self::Bricolage,
             8 => Self::Pixelify,
             9 => Self::Minecraft,
-            _ => Self::JetBrainsMono,
+            _ => Self::Minecraft,
         }
     }
 
@@ -116,7 +119,7 @@ pub struct FontConfig {
 impl Default for FontConfig {
     fn default() -> Self {
         Self {
-            face: FontFace::JetBrainsMono,
+            face: FontFace::Minecraft,
             scale: 1.00,
             shadow: false,
             bold_headers: true,
@@ -129,7 +132,7 @@ impl FontConfig {
     pub fn from_manager(manager: &ModuleManager) -> Self {
         let gui = manager.get(ModuleId::ClickGui);
         Self {
-            face: FontFace::from_index(gui.mode("font_face", 0)),
+            face: FontFace::from_index(gui.mode("font_face", DEFAULT_FONT_INDEX)),
             scale: (gui.float("font_scale", 1.00) as f32).clamp(0.70, 1.35),
             shadow: gui.bool("font_shadow", false),
             bold_headers: gui.bool("bold_headers", true),
@@ -338,8 +341,8 @@ mod tests {
     #[test]
     fn monospace_width_is_exact_and_uniform() {
         let draw = DummyDraw;
-        let font = FontConfig::default();
-        assert_eq!(font.face, FontFace::JetBrainsMono);
+        assert_eq!(FontConfig::default().face, FontFace::Minecraft);
+        let font = FontConfig::default().with_face(FontFace::JetBrainsMono);
         assert!((font.scale - 1.0).abs() < 1e-6);
         assert_eq!(font.width(&draw, "M", false), font.width(&draw, "i", false));
         assert_eq!(font.width(&draw, "Reset Layout", false), 66.0);

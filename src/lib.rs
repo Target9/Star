@@ -49,7 +49,7 @@ const HUD_OWNERS: &[ModuleId] = &[
     ModuleId::ItemEsp,
     ModuleId::DamageIndicators,
     ModuleId::Radar,
-    ModuleId::AimAssist,
+    ModuleId::AimVisuals,
 ];
 /// Modules whose code runs inside the world-geometry hook.
 const WORLD_OWNERS: &[ModuleId] = &[
@@ -59,7 +59,7 @@ const WORLD_OWNERS: &[ModuleId] = &[
     ModuleId::StorageEsp,
     ModuleId::Trajectories,
     ModuleId::Breadcrumbs,
-    ModuleId::AimAssist,
+    ModuleId::AimVisuals,
 ];
 /// Modules that need a per-tick world sample.
 const TICK_OWNERS: &[ModuleId] = &[
@@ -436,8 +436,9 @@ impl mod_api::Hooks for Mod {
                 &st.trackers,
             );
             let aim = st.manager.get(ModuleId::AimAssist);
+            let visuals = st.manager.get(ModuleId::AimVisuals);
             let theme = theme::Theme::from_manager(&st.manager, host.millis());
-            aim_assist::render_range_circle(host, event.draw, aim, theme.accent);
+            aim_assist::render_range_circle(host, event.draw, visuals, aim, theme.accent);
         });
     }
 

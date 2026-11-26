@@ -157,54 +157,89 @@ pub fn build_module() -> Module {
                 0.0,
             )
             .suffix("t"),
+        ],
+    }
+}
+
+/// Settings that used to live on Aim Assist and now belong to [`build_visuals_module`].
+/// Old configs are migrated by `config::deserialize`.
+pub const MOVED_VISUAL_SETTINGS: [&str; 8] = [
+    "show_target_hud",
+    "hud_name",
+    "hud_health",
+    "hud_distance",
+    "hud_angle",
+    "hud_ping",
+    "show_fov_circle",
+    "show_range_circle",
+];
+
+/// Constructs the `Aim Visuals` module: everything Aim Assist draws, as its own module.
+///
+/// It reads Aim Assist's range and FOV, so the FOV ring and range circle also work as a
+/// preview while tuning those values, even with Aim Assist switched off. The target
+/// info only appears while Aim Assist is actually tracking something.
+pub fn build_visuals_module() -> Module {
+    Module {
+        id: ModuleId::AimVisuals,
+        key: "aim_visuals",
+        name: "Aim Visuals",
+        description: "Target info, FOV ring and range circle for Aim Assist.",
+        category: Category::Render,
+        enabled: false,
+        keybind: None,
+        expanded: false,
+        show_in_arraylist: false,
+        settings: vec![
             Setting::bool(
                 "show_target_hud",
                 "Target HUD",
-                "Show a compact info box for the currently tracked target.",
+                "Show a compact info box and reticle for the target Aim Assist is tracking.",
                 true,
             )
-            .group("Visuals"),
+            .group("Target"),
             Setting::bool(
                 "hud_name",
-                "HUD Name",
+                "Name",
                 "Show the target's name in the Target HUD.",
                 true,
             ),
             Setting::bool(
                 "hud_health",
-                "HUD Health",
+                "Health",
                 "Show the target's health bar in the Target HUD.",
                 true,
             ),
             Setting::bool(
                 "hud_distance",
-                "HUD Distance",
+                "Distance",
                 "Show distance to the target in the Target HUD.",
                 true,
             ),
             Setting::bool(
                 "hud_angle",
-                "HUD Angle",
+                "Angle",
                 "Show angular offset to the target in the Target HUD.",
                 true,
             ),
             Setting::bool(
                 "hud_ping",
-                "HUD Ping",
+                "Ping",
                 "Show the target's tab-list ping (players) in the Target HUD.",
                 true,
             ),
             Setting::bool(
                 "show_fov_circle",
-                "FOV Indicator",
+                "FOV Ring",
                 "Draw a ring around the crosshair sized to the Aim Assist FOV vs your camera FOV.",
-                false,
-            ),
+                true,
+            )
+            .group("Indicators"),
             Setting::bool(
                 "show_range_circle",
                 "Range Circle",
                 "Draw a circle on the ground showing the Aim Assist range.",
-                false,
+                true,
             ),
         ],
     }
@@ -575,16 +610,20 @@ pub fn dist(a: [f64; 3], b: [f64; 3]) -> f64 {
     (dx * dx + dy * dy + dz * dz).sqrt()
 }
 
-/// Draws a flat range circle on the ground under the local player for Aim Assist's range setting.
+/// Draws a flat range circle on the ground under the local player, sized to Aim Assist's
+/// range. `visuals` is the Aim Visuals module (which decides whether it shows) and `aim`
+/// the Aim Assist module (which supplies the range).
 pub fn render_range_circle(
     host: &dyn ClientHost,
     draw: &mut dyn WorldDrawContext,
-    module: &Module,
+    visuals: &Module,
+    aim: &Module,
     accent: u32,
 ) {
-    if !module.enabled || !module.bool("show_range_circle", false) || !host.playing() {
+    if !visuals.enabled || !visuals.bool("show_range_circle", true) || !host.playing() {
         return;
     }
+    let module = aim;
     let Some(player) = host.camera_entity() else {
         return;
     };

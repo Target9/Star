@@ -69,8 +69,10 @@ pub fn render(
         toasts.clear();
     }
 
-    if aim.enabled {
-        if aim.bool("show_fov_circle", false) {
+    // Aim Visuals is its own module: it draws from Aim Assist's FOV, range and target.
+    let visuals = manager.get(ModuleId::AimVisuals);
+    if visuals.enabled {
+        if visuals.bool("show_fov_circle", true) {
             let aim_fov = aim.int("fov", 90) as f32;
             if aim_fov < 360.0 {
                 let camera_fov = host
@@ -87,11 +89,11 @@ pub fn render(
                 );
             }
         }
-        if aim.bool("show_target_hud", true)
+        if visuals.bool("show_target_hud", true)
             && let Some(info) = target
         {
             draw_target_reticle(host, draw, size, info.aim_point, theme.accent);
-            draw_target_hud(draw, size, info, aim, &theme, font, bg_alpha);
+            draw_target_hud(draw, size, info, visuals, &theme, font, bg_alpha);
         }
     }
 }
