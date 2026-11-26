@@ -8,18 +8,21 @@ mod entity_filter;
 mod font;
 mod font_metrics;
 mod gui;
+mod guard;
 mod hud;
 mod module;
 mod modules;
 mod settings;
 mod theme;
+mod toast;
 
 use std::sync::{Mutex, OnceLock};
 
 use mod_api::{
     self, CameraDistanceEvent, CameraShakeEvent, ClientHost, ClientTickPreEvent,
     EntityOutlineEvent, Flow, HostSide, InputKeyEvent, KeyAction, MouseButtonPreEvent,
-    PlayerBreakSpeedEvent, Registrar, RegistrationContext, RenderFogEvent, RenderFramePreEvent,
+    MovementInputEvent, PlayerBreakSpeedEvent, Registrar, RegistrationContext, RenderFogEvent,
+    RenderFramePreEvent,
     RenderGuiPostEvent, RenderLivingPostEvent, RenderNameTagEvent, RenderPlayerPreEvent,
     ScreenCharTypedPreEvent, ScreenClosingEvent, ScreenKeyPressedPreEvent,
     ScreenMouseButtonPressedPreEvent, ScreenMouseButtonReleasedPreEvent,
@@ -27,19 +30,60 @@ use mod_api::{
     SubmitCustomGeometryEvent, Zoom, ZoomEvent,
 };
 
-use crate::gui::ClickGuiState;
+use crate::gui::{ClickGuiState, ClipboardAction};
 use crate::module::{ModuleId, ModuleManager};
 use crate::modules::aim_assist::{self, AimTargetInfo};
-use crate::modules::{fast_mine, visuals};
+use crate::modules::movement::{MoveConfig, MoveInputState};
+use crate::modules::trackers::Trackers;
+use crate::modules::{extras, fast_mine, visuals};
+use crate::toast::{ToastKind, Toasts};
 
 const MOD_ID: &str = "star";
 const DEFAULT_GUI_KEY: &str = "key.keyboard.right.shift";
+
+/// Modules whose code runs inside the screen-space HUD hook.
+const HUD_OWNERS: &[ModuleId] = &[
+    ModuleId::Hud,
+    ModuleId::Esp,
+    ModuleId::Nametags,
+    ModuleId::ItemEsp,
+    ModuleId::DamageIndicators,
+    ModuleId::Radar,
+    ModuleId::AimAssist,
+];
+/// Modules whose code runs inside the world-geometry hook.
+const WORLD_OWNERS: &[ModuleId] = &[
+    ModuleId::Esp,
+    ModuleId::Tracers,
+    ModuleId::ItemEsp,
+    ModuleId::StorageEsp,
+    ModuleId::Trajectories,
+    ModuleId::Breadcrumbs,
+    ModuleId::AimAssist,
+];
+/// Modules that need a per-tick world sample.
+const TICK_OWNERS: &[ModuleId] = &[
+    ModuleId::Breadcrumbs,
+    ModuleId::DamageIndicators,
+    ModuleId::Trajectories,
+    ModuleId::StorageEsp,
+    ModuleId::Esp,
+    ModuleId::Tracers,
+    ModuleId::Nametags,
+    ModuleId::ItemEsp,
+    ModuleId::AimAssist,
+];
 
 struct ClientState {
     manager: ModuleManager,
     gui: ClickGuiState,
     aim_target: Option<AimTargetInfo>,
     interp: visuals::EntityInterpCache,
+    trackers: Trackers,
+    toasts: Toasts,
+    move_state: MoveInputState,
+    /// Enabled flag of every module as of the previous tick, to notice toggles.
+    prev_enabled: Vec<(ModuleId, bool)>,
 }
 
 impl ClientState {
@@ -49,6 +93,36 @@ impl ClientState {
             gui: ClickGuiState::default(),
             aim_target: None,
             interp: visuals::EntityInterpCache::default(),
+            trackers: Trackers::default(),
+            toasts: Toasts::default(),
+            move_state: MoveInputState::default(),
+            prev_enabled: Vec::new(),
+        }
+    }
+}
+
+/// Which modules are on, in `ModuleId::ALL` order.
+fn enabled_snapshot(manager: &ModuleManager) -> Vec<(ModuleId, bool)> {
+    ModuleId::ALL
+        .iter()
+        .map(|&id| (id, manager.get(id).enabled))
+        .collect()
+}
+
+/// Queues a toast for every module whose state differs from `before`.
+fn toast_toggles(manager: &ModuleManager, before: &[(ModuleId, bool)]) {
+    for &(id, was) in before {
+        if id == ModuleId::ClickGui {
+            continue;
+        }
+        let module = manager.get(id);
+        if module.enabled != was {
+            let (kind, word) = if module.enabled {
+                (ToastKind::Success, "enabled")
+            } else {
+                (ToastKind::Info, "disabled")
+            };
+            toast::notify(kind, format!("{} {word}", module.name));
         }
     }
 }
@@ -75,6 +149,19 @@ enum BindAction {
     CloseGui,
 }
 
+/// Switches hold-bound modules off when their key or mouse button is released.
+fn handle_bind_release(host: &mut dyn ClientHost, key: &str) {
+    let mut st = lock_state();
+    if !st.manager.config_loaded {
+        return;
+    }
+    let before = enabled_snapshot(&st.manager);
+    if st.manager.release_keybind(key) > 0 {
+        toast_toggles(&st.manager, &before);
+        config::save_throttled(host, &mut st.manager);
+    }
+}
+
 fn handle_bind_press(host: &mut dyn ClientHost, key: &str) {
     let action = {
         let mut st = lock_state();
@@ -96,8 +183,11 @@ fn handle_bind_press(host: &mut dyn ClientHost, key: &str) {
                     BindAction::None
                 }
             } else if host.playing() {
-                st.manager.trigger_keybind(key);
-                config::save(host, &mut st.manager);
+                let before = enabled_snapshot(&st.manager);
+                if st.manager.trigger_keybind(key) > 0 {
+                    toast_toggles(&st.manager, &before);
+                    config::save_throttled(host, &mut st.manager);
+                }
                 BindAction::None
             } else {
                 BindAction::None
@@ -114,6 +204,114 @@ fn handle_bind_press(host: &mut dyn ClientHost, key: &str) {
         }
         BindAction::None => {}
     }
+}
+
+/// Copies the setup to, or loads it from, the clipboard and tells the player how it went.
+fn run_clipboard_action(host: &dyn ClientHost, manager: &mut ModuleManager, action: ClipboardAction) {
+    match action {
+        ClipboardAction::Export => {
+            if host.set_clipboard_text(&config::export_text(manager)) {
+                toast::notify(ToastKind::Success, "Config copied to the clipboard");
+            } else {
+                toast::notify(ToastKind::Warning, "Could not copy the config");
+            }
+        }
+        ClipboardAction::Import => {
+            let text = host.clipboard_text().unwrap_or_default();
+            match config::import_text(manager, &text) {
+                Ok(()) => {
+                    manager.dirty = true;
+                    toast::notify(ToastKind::Success, "Config loaded from the clipboard");
+                }
+                Err(msg) => toast::notify(ToastKind::Warning, msg),
+            }
+        }
+    }
+}
+
+/// Switches off modules that kept panicking and tells the player.
+fn apply_guard_trips() {
+    for id in guard::take_trips() {
+        let mut st = lock_state();
+        let module = st.manager.get_mut(id);
+        let name = module.name;
+        module.enabled = false;
+        st.manager.dirty = true;
+        toast::notify(
+            ToastKind::Error,
+            format!("{name} hit an error and was switched off"),
+        );
+    }
+}
+
+/// Gives a module a fresh panic budget whenever the player turns it back on.
+fn refresh_enabled_snapshot() {
+    let mut st = lock_state();
+    let now = enabled_snapshot(&st.manager);
+    for (&(id, was), &(_, is)) in st.prev_enabled.iter().zip(now.iter()) {
+        if is && !was {
+            guard::clear(id);
+        }
+    }
+    st.prev_enabled = now;
+}
+
+fn tick_pre(host: &mut dyn ClientHost) {
+    if !mod_active(host) {
+        let mut st = lock_state();
+        st.aim_target = None;
+        st.interp.clear();
+        return;
+    }
+
+    apply_guard_trips();
+    refresh_enabled_snapshot();
+
+    let (aim_module, need_interp, should_load) = {
+        let st = lock_state();
+        let need_interp = [
+            ModuleId::Esp,
+            ModuleId::Tracers,
+            ModuleId::Nametags,
+            ModuleId::ItemEsp,
+        ]
+        .iter()
+        .any(|&id| st.manager.is_enabled(id));
+        (
+            st.manager.get(ModuleId::AimAssist).clone(),
+            need_interp,
+            !st.manager.config_loaded,
+        )
+    };
+
+    {
+        let mut st = lock_state();
+        if should_load {
+            config::load(host, &mut st.manager);
+        } else {
+            config::save_throttled(host, &mut st.manager);
+        }
+    }
+
+    // Snapshot entity boxes once per tick before Horizon advances positions for smooth 3D/2D lerp.
+    // Samples such as speed, trails and damage numbers share the same tick.
+    guard::run(TICK_OWNERS, (), || {
+        let mut st = lock_state();
+        st.interp.on_tick_pre(host, need_interp);
+        let ClientState {
+            manager, trackers, ..
+        } = &mut *st;
+        trackers.on_tick(host, manager);
+    });
+
+    guard::run(&[ModuleId::AimAssist], (), || {
+        if aim_module.enabled && aim_module.mode("update_rate", 0) == 1 {
+            let target = aim_assist::step(host, &aim_module, 1.0, false);
+            lock_state().aim_target = target;
+        } else if !aim_module.enabled || !host.playing() {
+            lock_state().aim_target = None;
+        }
+    });
 }
 
 #[derive(Default)]
@@ -137,10 +335,16 @@ impl mod_api::Hooks for Mod {
     }
 
     fn input_key(&self, host: &mut dyn ClientHost, event: &mut InputKeyEvent<'_>) {
-        if !mod_active(host) || event.action != KeyAction::Press {
-            return;
-        }
-        handle_bind_press(host, event.key);
+        guard::run(&[], (), || {
+            if !mod_active(host) {
+                return;
+            }
+            match event.action {
+                KeyAction::Press => handle_bind_press(host, event.key),
+                KeyAction::Release => handle_bind_release(host, event.key),
+                _ => {}
+            }
+        });
     }
 
     fn mouse_button_pre(
@@ -148,75 +352,68 @@ impl mod_api::Hooks for Mod {
         host: &mut dyn ClientHost,
         event: &mut MouseButtonPreEvent,
     ) -> Flow {
-        if !mod_active(host) || !event.pressed || event.cancelled {
-            return Flow::Continue;
-        }
-        // ClickGUI already captures mouse through screen_* hooks while open.
-        if host.mod_screen() == Some(MOD_ID) {
-            return Flow::Continue;
-        }
-        let Some(key) = settings::mouse_button_key(event.button) else {
-            return Flow::Continue;
-        };
-        handle_bind_press(host, key);
-        Flow::Continue
+        guard::run(&[], Flow::Continue, || {
+            if !mod_active(host) || event.cancelled {
+                return Flow::Continue;
+            }
+            // ClickGUI already captures mouse through screen_* hooks while open.
+            if host.mod_screen() == Some(MOD_ID) {
+                return Flow::Continue;
+            }
+            let Some(key) = settings::mouse_button_key(event.button) else {
+                return Flow::Continue;
+            };
+            if event.pressed {
+                handle_bind_press(host, key);
+            } else {
+                handle_bind_release(host, key);
+            }
+            Flow::Continue
+        })
     }
 
     fn client_tick_pre(&self, host: &mut dyn ClientHost, _: &mut ClientTickPreEvent) {
-        if !mod_active(host) {
-            let mut st = lock_state();
-            st.aim_target = None;
-            st.interp.clear();
-            return;
-        }
-
-        let (aim_module, need_interp, should_load, should_save) = {
-            let st = lock_state();
-            let need_interp = st.manager.is_enabled(ModuleId::Esp)
-                || st.manager.is_enabled(ModuleId::Tracers)
-                || st.manager.is_enabled(ModuleId::Nametags);
-            (
-                st.manager.get(ModuleId::AimAssist).clone(),
-                need_interp,
-                !st.manager.config_loaded,
-                st.manager.dirty,
-            )
-        };
-
-        if should_load {
-            let mut st = lock_state();
-            config::load(host, &mut st.manager);
-        } else if should_save {
-            let mut st = lock_state();
-            config::save(host, &mut st.manager);
-        }
-
-        // Snapshot entity boxes once per tick before Horizon advances positions for smooth 3D/2D lerp.
-        lock_state().interp.on_tick_pre(host, need_interp);
-
-        if aim_module.enabled && aim_module.mode("update_rate", 0) == 1 {
-            let target = aim_assist::step(host, &aim_module, 1.0, false);
-            lock_state().aim_target = target;
-        } else if !aim_module.enabled || !host.playing() {
-            lock_state().aim_target = None;
-        }
+        guard::run(&[], (), || tick_pre(host));
     }
 
     fn render_frame_pre(&self, host: &mut dyn ClientHost, event: &mut RenderFramePreEvent) {
-        if !mod_active(host) || !host.playing() {
-            return;
-        }
+        guard::run(&[ModuleId::AimAssist], (), || {
+            if !mod_active(host) || !host.playing() {
+                return;
+            }
 
-        let aim_module = {
+            let aim_module = {
+                let mut st = lock_state();
+                st.interp.last_partial_tick = event.world_partial_tick;
+                st.trackers.on_frame(host, event.elapsed.as_secs_f32());
+                st.manager.get(ModuleId::AimAssist).clone()
+            };
+            if aim_module.enabled && aim_module.mode("update_rate", 0) == 0 {
+                let tick_scale = (event.elapsed.as_secs_f32() * 20.0).clamp(0.02, 2.0);
+                let target = aim_assist::step(host, &aim_module, tick_scale, true);
+                lock_state().aim_target = target;
+            }
+        });
+    }
+
+    fn movement_input(&self, host: &dyn ClientHost, event: &mut MovementInputEvent) {
+        let owners = [ModuleId::Sprint, ModuleId::ToggleSneak, ModuleId::AutoWalk];
+        guard::run(&owners, (), || {
+            let active = mod_active(host);
             let mut st = lock_state();
-            st.interp.last_partial_tick = event.world_partial_tick;
-            st.manager.get(ModuleId::AimAssist).clone()
-        };
-        if aim_module.enabled && aim_module.mode("update_rate", 0) == 0 {
-            let tick_scale = (event.elapsed.as_secs_f32() * 20.0).clamp(0.02, 2.0);
-            let target = aim_assist::step(host, &aim_module, tick_scale, true);
-            lock_state().aim_target = target;
-        }
+            // The hook replaces vanilla's sprint latch, so it always runs through the
+            // emulation, but the modules only act while Star itself is on.
+            let cfg = if active {
+                MoveConfig::from_modules(
+                    st.manager.get(ModuleId::Sprint),
+                    st.manager.get(ModuleId::ToggleSneak),
+                    st.manager.get(ModuleId::AutoWalk),
+                )
+            } else {
+                MoveConfig::default()
+            };
+            st.move_state.apply(cfg, event, host.millis());
+        });
     }
 
     fn submit_custom_geometry(
@@ -224,14 +421,24 @@ impl mod_api::Hooks for Mod {
         host: &dyn ClientHost,
         event: &mut SubmitCustomGeometryEvent<'_>,
     ) {
-        if !mod_active(host) {
-            return;
-        }
-        let st = lock_state();
-        visuals::render_world_geometry(host, event.view, event.draw, &st.manager, &st.interp);
-        let aim = st.manager.get(ModuleId::AimAssist);
-        let theme = theme::Theme::from_manager(&st.manager, host.millis());
-        aim_assist::render_range_circle(host, event.draw, aim, theme.accent);
+        guard::run(WORLD_OWNERS, (), || {
+            if !mod_active(host) {
+                return;
+            }
+            let st = lock_state();
+            visuals::render_world_geometry(host, event.view, event.draw, &st.manager, &st.interp);
+            extras::render_world(
+                host,
+                event.view,
+                event.draw,
+                &st.manager,
+                &st.interp,
+                &st.trackers,
+            );
+            let aim = st.manager.get(ModuleId::AimAssist);
+            let theme = theme::Theme::from_manager(&st.manager, host.millis());
+            aim_assist::render_range_circle(host, event.draw, aim, theme.accent);
+        });
     }
 
     fn render_player_pre(
@@ -239,67 +446,83 @@ impl mod_api::Hooks for Mod {
         host: &dyn ClientHost,
         event: &mut RenderPlayerPreEvent<'_>,
     ) -> Flow {
-        if mod_active(host) {
-            let st = lock_state();
-            visuals::apply_skin_player_pre(host, &st.manager, event);
-        }
-        Flow::Continue
+        guard::run(&[ModuleId::Esp], Flow::Continue, || {
+            if mod_active(host) {
+                let st = lock_state();
+                visuals::apply_skin_player_pre(host, &st.manager, event);
+            }
+            Flow::Continue
+        })
     }
 
     fn render_living_post(&self, host: &dyn ClientHost, event: &mut RenderLivingPostEvent<'_>) {
-        if !mod_active(host) {
-            return;
-        }
-        let st = lock_state();
-        visuals::apply_skin_living_post(host, &st.manager, event);
+        guard::run(&[ModuleId::Esp], (), || {
+            if !mod_active(host) {
+                return;
+            }
+            let st = lock_state();
+            visuals::apply_skin_living_post(host, &st.manager, event);
+        });
     }
 
     fn entity_outline(&self, host: &dyn ClientHost, event: &mut EntityOutlineEvent<'_>) {
-        if !mod_active(host) {
-            return;
-        }
-        let st = lock_state();
-        visuals::apply_skin_outline(host, &st.manager, event);
+        guard::run(&[ModuleId::Esp], (), || {
+            if !mod_active(host) {
+                return;
+            }
+            let st = lock_state();
+            visuals::apply_skin_outline(host, &st.manager, event);
+        });
     }
 
     fn render_fog(&self, host: &dyn ClientHost, event: &mut RenderFogEvent<'_>) {
-        if !mod_active(host) {
-            return;
-        }
-        let no_fog = lock_state().manager.get(ModuleId::NoFog).clone();
-        visuals::apply_no_fog(&no_fog, event);
+        guard::run(&[ModuleId::NoFog], (), || {
+            if !mod_active(host) {
+                return;
+            }
+            let no_fog = lock_state().manager.get(ModuleId::NoFog).clone();
+            visuals::apply_no_fog(&no_fog, event);
+        });
     }
 
     fn zoom(&self, host: &dyn ClientHost, _: &mut ZoomEvent) -> Option<Zoom> {
-        if !mod_active(host) {
-            return None;
-        }
-        let zoom_mod = lock_state().manager.get(ModuleId::Zoom).clone();
-        visuals::apply_zoom(&zoom_mod)
+        guard::run(&[ModuleId::Zoom], None, || {
+            if !mod_active(host) {
+                return None;
+            }
+            let zoom_mod = lock_state().manager.get(ModuleId::Zoom).clone();
+            visuals::apply_zoom(&zoom_mod)
+        })
     }
 
     fn camera_shake(&self, host: &dyn ClientHost, event: &mut CameraShakeEvent<'_>) {
-        if !mod_active(host) {
-            return;
-        }
-        let cam = lock_state().manager.get(ModuleId::Camera).clone();
-        visuals::apply_camera_shake(&cam, event);
+        guard::run(&[ModuleId::Camera], (), || {
+            if !mod_active(host) {
+                return;
+            }
+            let cam = lock_state().manager.get(ModuleId::Camera).clone();
+            visuals::apply_camera_shake(&cam, event);
+        });
     }
 
     fn camera_distance(&self, host: &dyn ClientHost, event: &mut CameraDistanceEvent<'_>) {
-        if !mod_active(host) {
-            return;
-        }
-        let cam = lock_state().manager.get(ModuleId::Camera).clone();
-        visuals::apply_camera_distance(&cam, event);
+        guard::run(&[ModuleId::Camera], (), || {
+            if !mod_active(host) {
+                return;
+            }
+            let cam = lock_state().manager.get(ModuleId::Camera).clone();
+            visuals::apply_camera_distance(&cam, event);
+        });
     }
 
     fn render_name_tag(&self, host: &dyn ClientHost, event: &mut RenderNameTagEvent<'_>) {
-        if !mod_active(host) {
-            return;
-        }
-        let nt = lock_state().manager.get(ModuleId::Nametags).clone();
-        visuals::apply_nametag_hide(&nt, event);
+        guard::run(&[ModuleId::Nametags], (), || {
+            if !mod_active(host) {
+                return;
+            }
+            let nt = lock_state().manager.get(ModuleId::Nametags).clone();
+            visuals::apply_nametag_hide(&nt, event);
+        });
     }
 
     fn player_break_speed(
@@ -307,32 +530,53 @@ impl mod_api::Hooks for Mod {
         _host: HostSide<'_>,
         event: &mut PlayerBreakSpeedEvent,
     ) -> Flow {
-        let fast = lock_state().manager.get(ModuleId::FastMine).clone();
-        fast_mine::apply_break_speed(&fast, event);
-        Flow::Continue
+        guard::run(&[ModuleId::FastMine], Flow::Continue, || {
+            let fast = lock_state().manager.get(ModuleId::FastMine).clone();
+            fast_mine::apply_break_speed(&fast, event);
+            Flow::Continue
+        })
     }
 
     fn render_gui_post(&self, host: &dyn ClientHost, event: &mut RenderGuiPostEvent<'_>) {
-        if !mod_active(host) {
-            return;
-        }
-        let st = lock_state();
-        hud::render(
-            host,
-            event.draw,
-            &st.manager,
-            &st.interp,
-            st.aim_target.as_ref(),
-        );
+        guard::run(HUD_OWNERS, (), || {
+            if !mod_active(host) {
+                return;
+            }
+            let mut st = lock_state();
+            let ClientState {
+                manager,
+                interp,
+                aim_target,
+                trackers,
+                toasts,
+                ..
+            } = &mut *st;
+            hud::render(
+                host,
+                event.draw,
+                manager,
+                interp,
+                aim_target.as_ref(),
+                trackers,
+                toasts,
+            );
+        });
     }
 
     fn screen_render_post(&self, host: &dyn ClientHost, event: &mut ScreenRenderPostEvent<'_>) {
-        if host.mod_screen() != Some(MOD_ID) {
-            return;
-        }
-        let mut st = lock_state();
-        let ClientState { manager, gui, .. } = &mut *st;
-        gui.render(host, event.draw, event.screen.mouse, manager);
+        guard::run(&[], (), || {
+            if host.mod_screen() != Some(MOD_ID) {
+                return;
+            }
+            let mut st = lock_state();
+            let ClientState {
+                manager,
+                gui,
+                trackers,
+                ..
+            } = &mut *st;
+            gui.render(host, event.draw, event.screen.mouse, manager, trackers);
+        });
     }
 
     fn screen_mouse_button_pressed_pre(
@@ -340,16 +584,21 @@ impl mod_api::Hooks for Mod {
         host: &dyn ClientHost,
         event: &mut ScreenMouseButtonPressedPreEvent<'_>,
     ) -> Flow {
-        if host.mod_screen() != Some(MOD_ID) {
-            return Flow::Continue;
-        }
-        let mut st = lock_state();
-        let ClientState { manager, gui, .. } = &mut *st;
-        if gui.mouse_pressed(event.screen.mouse, event.button, manager) {
-            config::save(host, manager);
-            return Flow::Cancel;
-        }
-        Flow::Continue
+        guard::run(&[], Flow::Continue, || {
+            if host.mod_screen() != Some(MOD_ID) {
+                return Flow::Continue;
+            }
+            let mut st = lock_state();
+            let ClientState { manager, gui, .. } = &mut *st;
+            if gui.mouse_pressed(event.screen.mouse, event.button, manager) {
+                if let Some(action) = gui.take_clipboard_action() {
+                    run_clipboard_action(host, manager, action);
+                }
+                config::save(host, manager);
+                return Flow::Cancel;
+            }
+            Flow::Continue
+        })
     }
 
     fn screen_mouse_dragged_pre(
@@ -357,15 +606,17 @@ impl mod_api::Hooks for Mod {
         host: &dyn ClientHost,
         event: &mut ScreenMouseDraggedPreEvent<'_>,
     ) -> Flow {
-        if host.mod_screen() != Some(MOD_ID) {
-            return Flow::Continue;
-        }
-        let mut st = lock_state();
-        let ClientState { manager, gui, .. } = &mut *st;
-        if gui.mouse_dragged(event.screen.mouse, manager) {
-            return Flow::Cancel;
-        }
-        Flow::Continue
+        guard::run(&[], Flow::Continue, || {
+            if host.mod_screen() != Some(MOD_ID) {
+                return Flow::Continue;
+            }
+            let mut st = lock_state();
+            let ClientState { manager, gui, .. } = &mut *st;
+            if gui.mouse_dragged(event.screen.mouse, manager) {
+                return Flow::Cancel;
+            }
+            Flow::Continue
+        })
     }
 
     fn screen_mouse_button_released_pre(
@@ -373,16 +624,18 @@ impl mod_api::Hooks for Mod {
         host: &dyn ClientHost,
         _event: &mut ScreenMouseButtonReleasedPreEvent<'_>,
     ) -> Flow {
-        if host.mod_screen() != Some(MOD_ID) {
-            return Flow::Continue;
-        }
-        let mut st = lock_state();
-        let ClientState { manager, gui, .. } = &mut *st;
-        if gui.mouse_released() {
-            config::save(host, manager);
-            return Flow::Cancel;
-        }
-        Flow::Continue
+        guard::run(&[], Flow::Continue, || {
+            if host.mod_screen() != Some(MOD_ID) {
+                return Flow::Continue;
+            }
+            let mut st = lock_state();
+            let ClientState { manager, gui, .. } = &mut *st;
+            if gui.mouse_released() {
+                config::save(host, manager);
+                return Flow::Cancel;
+            }
+            Flow::Continue
+        })
     }
 
     fn screen_mouse_scrolled_pre(
@@ -390,16 +643,18 @@ impl mod_api::Hooks for Mod {
         host: &dyn ClientHost,
         event: &mut ScreenMouseScrolledPreEvent<'_>,
     ) -> Flow {
-        if host.mod_screen() != Some(MOD_ID) {
-            return Flow::Continue;
-        }
-        let mut st = lock_state();
-        let ClientState { manager, gui, .. } = &mut *st;
-        if gui.mouse_scrolled(event.screen.mouse, event.scroll[1], event.modifiers, manager) {
-            config::save(host, manager);
-            return Flow::Cancel;
-        }
-        Flow::Continue
+        guard::run(&[], Flow::Continue, || {
+            if host.mod_screen() != Some(MOD_ID) {
+                return Flow::Continue;
+            }
+            let mut st = lock_state();
+            let ClientState { manager, gui, .. } = &mut *st;
+            if gui.mouse_scrolled(event.screen.mouse, event.scroll[1], event.modifiers, manager) {
+                config::save_throttled(host, manager);
+                return Flow::Cancel;
+            }
+            Flow::Continue
+        })
     }
 
     fn screen_key_pressed_pre(
@@ -407,16 +662,18 @@ impl mod_api::Hooks for Mod {
         host: &dyn ClientHost,
         event: &mut ScreenKeyPressedPreEvent<'_>,
     ) -> Flow {
-        if host.mod_screen() != Some(MOD_ID) {
-            return Flow::Continue;
-        }
-        let mut st = lock_state();
-        let ClientState { manager, gui, .. } = &mut *st;
-        if gui.key_pressed(event.key, manager) {
-            config::save(host, manager);
-            return Flow::Cancel;
-        }
-        Flow::Continue
+        guard::run(&[], Flow::Continue, || {
+            if host.mod_screen() != Some(MOD_ID) {
+                return Flow::Continue;
+            }
+            let mut st = lock_state();
+            let ClientState { manager, gui, .. } = &mut *st;
+            if gui.key_pressed(event.key, manager) {
+                config::save(host, manager);
+                return Flow::Cancel;
+            }
+            Flow::Continue
+        })
     }
 
     fn screen_char_typed_pre(
@@ -424,22 +681,26 @@ impl mod_api::Hooks for Mod {
         host: &dyn ClientHost,
         event: &mut ScreenCharTypedPreEvent<'_>,
     ) -> Flow {
-        if host.mod_screen() != Some(MOD_ID) {
-            return Flow::Continue;
-        }
-        let mut st = lock_state();
-        if st.gui.char_typed(event.c) {
-            return Flow::Cancel;
-        }
-        Flow::Continue
+        guard::run(&[], Flow::Continue, || {
+            if host.mod_screen() != Some(MOD_ID) {
+                return Flow::Continue;
+            }
+            let mut st = lock_state();
+            if st.gui.char_typed(event.c) {
+                return Flow::Cancel;
+            }
+            Flow::Continue
+        })
     }
 
     fn screen_closing(&self, host: &dyn ClientHost, _event: &mut ScreenClosingEvent<'_>) {
-        if host.mod_screen() != Some(MOD_ID) {
-            return;
-        }
-        let mut st = lock_state();
-        st.gui.on_close();
-        config::save(host, &mut st.manager);
+        guard::run(&[], (), || {
+            if host.mod_screen() != Some(MOD_ID) {
+                return;
+            }
+            let mut st = lock_state();
+            st.gui.on_close();
+            config::save(host, &mut st.manager);
+        });
     }
 }

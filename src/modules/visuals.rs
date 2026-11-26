@@ -13,6 +13,8 @@ use mod_api::{
 use crate::entity_filter::{EntityFilter, classify_entity_id, pretty_entity_id};
 use crate::font::FontConfig;
 use crate::module::{Category, Module, ModuleId, ModuleManager};
+use crate::modules::extras;
+use crate::modules::trackers::Trackers;
 use crate::settings::Setting;
 use crate::theme::{Theme, with_alpha};
 
@@ -370,6 +372,25 @@ pub fn build_nametags_module() -> Module {
                 "Hide Vanilla Tag",
                 "Hide Minecraft's built-in nametag for entities shown by Star Nametags.",
                 true,
+            ),
+            Setting::bool(
+                "show_item",
+                "Held Item",
+                "Show the item in the entity's main hand above its name.",
+                false,
+            )
+            .group("Extra Line"),
+            Setting::bool(
+                "show_armor",
+                "Armor",
+                "Show the average remaining durability of the entity's worn armor.",
+                false,
+            ),
+            Setting::bool(
+                "show_ping",
+                "Ping",
+                "Show the player's latency from the tab list.",
+                false,
             ),
         ],
     }
@@ -872,6 +893,7 @@ pub fn render_screen_overlays(
     draw: &mut dyn DrawContext,
     manager: &ModuleManager,
     interp: &EntityInterpCache,
+    trackers: &Trackers,
     theme: &Theme,
     font: FontConfig,
 ) {
@@ -1069,6 +1091,50 @@ pub fn render_screen_overlays(
                 if let Some(dist_txt) = dist_part {
                     nt_font.draw_body(draw, &dist_txt, [cx, ty], theme.text_muted);
                 }
+
+                // Optional second pill above the name: held item, armor, ping.
+                let mut extra: Vec<(String, u32)> = Vec::new();
+                if nametags.bool("show_item", false)
+                    && let Some(item) = extras::held_item_name(host, entity)
+                {
+                    extra.push((item, theme.text));
+                }
+                if nametags.bool("show_armor", false)
+                    && let Some(pct) = extras::armor_percent(host, entity)
+                {
+                    extra.push((format!("Armor {pct:.0}%"), health_color(pct / 100.0)));
+                }
+                if nametags.bool("show_ping", false)
+                    && let Some(ms) = trackers.ping_of(&name)
+                {
+                    extra.push((format!("{ms}ms"), theme.text_muted));
+                }
+                if !extra.is_empty() {
+                    let sep = " | ";
+                    let sep_w = nt_font.width(draw, sep, false);
+                    let total_w: f32 = extra
+                        .iter()
+                        .map(|(t, _)| nt_font.width(draw, t, false))
+                        .sum::<f32>()
+                        + sep_w * (extra.len() - 1) as f32;
+                    let w2 = total_w + pad_x * 2.0;
+                    let h2 = box_h - 1.0;
+                    let x2 = sx - w2 * 0.5;
+                    let y2 = by - h2 - 1.0;
+                    if nt_bg_alpha > 0 {
+                        draw.fill([x2, y2, w2, h2], with_alpha(theme.panel_bg, nt_bg_alpha));
+                    }
+                    let ty2 = nt_font.center_y(y2, h2);
+                    let mut cx2 = x2 + pad_x;
+                    for (i, (text, color)) in extra.iter().enumerate() {
+                        if i > 0 {
+                            nt_font.draw_body(draw, sep, [cx2, ty2], theme.text_muted);
+                            cx2 += sep_w;
+                        }
+                        nt_font.draw_body(draw, text, [cx2, ty2], *color);
+                        cx2 += nt_font.width(draw, text, false);
+                    }
+                }
             }
         }
     }
@@ -1142,7 +1208,7 @@ pub fn apply_nametag_hide(module: &Module, event: &mut RenderNameTagEvent<'_>) {
 // Geometry & projection helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn entity_color(
+pub(crate) fn entity_color(
     kind_id: &str,
     distance: f64,
     max_range: f64,
@@ -1160,7 +1226,7 @@ fn entity_color(
     }
 }
 
-fn health_color(frac: f32) -> u32 {
+pub(crate) fn health_color(frac: f32) -> u32 {
     let f = frac.clamp(0.0, 1.0);
     let (r, g, b) = if f < 0.5 {
         let t = f * 2.0;
@@ -1172,7 +1238,7 @@ fn health_color(frac: f32) -> u32 {
     0xFF00_0000 | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
 }
 
-fn push_box_lines(
+pub(crate) fn push_box_lines(
     out: &mut Vec<WorldLine>,
     lo: [f64; 3],
     hi: [f64; 3],
@@ -1209,7 +1275,7 @@ fn push_box_lines(
     }
 }
 
-fn push_box_quads(
+pub(crate) fn push_box_quads(
     out: &mut Vec<WorldQuad>,
     lo: [f64; 3],
     hi: [f64; 3],
@@ -1234,7 +1300,7 @@ fn push_box_quads(
     }
 }
 
-fn project_point(host: &dyn ClientHost, size: [f32; 2], world: [f64; 3]) -> Option<[f32; 2]> {
+pub(crate) fn project_point(host: &dyn ClientHost, size: [f32; 2], world: [f64; 3]) -> Option<[f32; 2]> {
     let [ndc_x, ndc_y, ndc_z] = host.project(world)?;
     if !ndc_x.is_finite() || !ndc_y.is_finite() || !ndc_z.is_finite() || ndc_z > 1.0 {
         return None;
@@ -1247,7 +1313,7 @@ fn project_point(host: &dyn ClientHost, size: [f32; 2], world: [f64; 3]) -> Opti
     Some([sx, sy])
 }
 
-fn project_aabb(
+pub(crate) fn project_aabb(
     host: &dyn ClientHost,
     size: [f32; 2],
     lo: [f64; 3],
@@ -1284,7 +1350,7 @@ fn project_aabb(
     Some([min_x, min_y, max_x, max_y])
 }
 
-fn draw_rect_outline(draw: &mut dyn DrawContext, rect: [f32; 4], t: f32, color: u32) {
+pub(crate) fn draw_rect_outline(draw: &mut dyn DrawContext, rect: [f32; 4], t: f32, color: u32) {
     let [x, y, w, h] = rect;
     draw.fill([x, y, w, t], color);
     draw.fill([x, y + h - t, w, t], color);
@@ -1310,14 +1376,14 @@ fn draw_corner_box(draw: &mut dyn DrawContext, rect: [f32; 4], t: f32, color: u3
     draw.fill([x + w - t, y + h - ch, t, ch], color);
 }
 
-fn dist3(a: [f64; 3], b: [f64; 3]) -> f64 {
+pub(crate) fn dist3(a: [f64; 3], b: [f64; 3]) -> f64 {
     let dx = a[0] - b[0];
     let dy = a[1] - b[1];
     let dz = a[2] - b[2];
     (dx * dx + dy * dy + dz * dz).sqrt()
 }
 
-fn look_dir(yaw_deg: f32, pitch_deg: f32) -> [f64; 3] {
+pub(crate) fn look_dir(yaw_deg: f32, pitch_deg: f32) -> [f64; 3] {
     let yaw = (yaw_deg as f64).to_radians();
     let pitch = (pitch_deg as f64).to_radians();
     let cp = pitch.cos();

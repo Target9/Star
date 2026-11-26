@@ -1,8 +1,10 @@
 //! Categories, module definitions, and the central `ModuleManager`.
 
+use std::collections::{BTreeMap, HashSet};
+
 use crate::entity_filter::EntityFilter;
 use crate::font::FONT_PRESETS;
-use crate::modules::{aim_assist, fast_mine, visuals};
+use crate::modules::{aim_assist, extras, fast_mine, movement, visuals};
 use crate::settings::Setting;
 use crate::theme::THEME_PRESETS;
 
@@ -90,8 +92,83 @@ pub enum ModuleId {
     NoFog,
     Zoom,
     Camera,
+    ItemEsp,
+    StorageEsp,
+    Trajectories,
+    Breadcrumbs,
+    DamageIndicators,
+    Radar,
+    Sprint,
+    ToggleSneak,
+    AutoWalk,
     Hud,
     ClickGui,
+}
+
+impl ModuleId {
+    /// Every module id, in registration order.
+    pub const ALL: [ModuleId; 19] = [
+        ModuleId::AimAssist,
+        ModuleId::FastMine,
+        ModuleId::Esp,
+        ModuleId::Tracers,
+        ModuleId::Nametags,
+        ModuleId::NoFog,
+        ModuleId::Zoom,
+        ModuleId::Camera,
+        ModuleId::ItemEsp,
+        ModuleId::StorageEsp,
+        ModuleId::Trajectories,
+        ModuleId::Breadcrumbs,
+        ModuleId::DamageIndicators,
+        ModuleId::Radar,
+        ModuleId::Sprint,
+        ModuleId::ToggleSneak,
+        ModuleId::AutoWalk,
+        ModuleId::Hud,
+        ModuleId::ClickGui,
+    ];
+}
+
+/// How a module's keybind drives its enabled state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum BindMode {
+    /// Each press flips the module on or off.
+    #[default]
+    Toggle,
+    /// The module is on only while the key is held.
+    Hold,
+}
+
+impl BindMode {
+    pub fn id(self) -> &'static str {
+        match self {
+            BindMode::Toggle => "toggle",
+            BindMode::Hold => "hold",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            BindMode::Toggle => "Toggle",
+            BindMode::Hold => "Hold",
+        }
+    }
+
+    pub fn from_id(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "toggle" => Some(BindMode::Toggle),
+            "hold" => Some(BindMode::Hold),
+            _ => None,
+        }
+    }
+
+    pub fn flipped(self) -> Self {
+        match self {
+            BindMode::Toggle => BindMode::Hold,
+            BindMode::Hold => BindMode::Toggle,
+        }
+    }
 }
 
 /// One toggleable feature/module displayed in its category window or top tab.
@@ -169,7 +246,19 @@ impl Module {
             ModuleId::Tracers => Some(self.mode_str("target_point", "Center").to_owned()),
             ModuleId::Nametags => Some(format!("{:.0}m", self.float("range", 64.0))),
             ModuleId::Zoom => Some(format!("{:.1}x", self.float("factor", 4.0))),
-            ModuleId::NoFog | ModuleId::Camera | ModuleId::Hud | ModuleId::ClickGui => None,
+            ModuleId::ItemEsp => Some(format!("{:.0}m", self.float("range", 48.0))),
+            ModuleId::StorageEsp => Some(format!("{:.0}m", self.float("range", 48.0))),
+            ModuleId::Trajectories => Some(self.mode_str("style", "Line").to_owned()),
+            ModuleId::Breadcrumbs => Some(self.mode_str("source", "Self").to_owned()),
+            ModuleId::DamageIndicators => Some(format!("{:.0}m", self.float("range", 32.0))),
+            ModuleId::Radar => Some(format!("{:.0}m", self.float("range", 48.0))),
+            ModuleId::Sprint => Some(self.mode_str("mode", "Forward").to_owned()),
+            ModuleId::NoFog
+            | ModuleId::Camera
+            | ModuleId::ToggleSneak
+            | ModuleId::AutoWalk
+            | ModuleId::Hud
+            | ModuleId::ClickGui => None,
         }
     }
 }
@@ -183,12 +272,35 @@ pub struct PanelState {
     pub scroll: f32,
 }
 
-/// Central registry of all modules, panel layouts, and config dirty state.
+/// A named snapshot of modules, keybinds, settings, and panel layout.
+#[derive(Clone, Debug)]
+pub struct SavedProfile {
+    pub name: String,
+    pub body: String,
+}
+
+/// Central registry of all modules, panel layouts, profiles, and config dirty state.
 pub struct ModuleManager {
     pub modules: Vec<Module>,
     pub panels: [PanelState; 5],
     pub config_loaded: bool,
     pub dirty: bool,
+    /// Profile last loaded or saved. Empty when the live setup doesn't match a snapshot.
+    pub active_profile: String,
+    pub profiles: Vec<SavedProfile>,
+    pub profiles_dirty: bool,
+    /// Modules whose keybind is held rather than toggled.
+    pub hold_binds: HashSet<ModuleId>,
+    /// Modules pinned to the top of their panel.
+    pub favorites: HashSet<ModuleId>,
+    /// Dragged HUD widget positions (top-left, GUI pixels), keyed by widget id.
+    pub hud_positions: BTreeMap<String, [f32; 2]>,
+    /// Millisecond timestamp of the last successful config write (for save throttling).
+    pub last_save_ms: u64,
+    /// Whether the previous session's config has been copied to the backup file this session.
+    pub backup_written: bool,
+    /// Inert module returned when a lookup misses, so hooks never panic.
+    fallback: Module,
 }
 
 impl Default for ModuleManager {
@@ -208,6 +320,15 @@ impl ModuleManager {
             visuals::build_no_fog_module(),
             visuals::build_zoom_module(),
             visuals::build_camera_module(),
+            extras::build_item_esp_module(),
+            extras::build_storage_esp_module(),
+            extras::build_trajectories_module(),
+            extras::build_breadcrumbs_module(),
+            extras::build_damage_indicators_module(),
+            extras::build_radar_module(),
+            movement::build_sprint_module(),
+            movement::build_toggle_sneak_module(),
+            movement::build_auto_walk_module(),
             build_hud_module(),
             build_click_gui_module(),
         ];
@@ -216,7 +337,75 @@ impl ModuleManager {
             panels: default_panels(154.0),
             config_loaded: false,
             dirty: false,
+            active_profile: String::new(),
+            profiles: Vec::new(),
+            profiles_dirty: false,
+            hold_binds: HashSet::new(),
+            favorites: HashSet::new(),
+            hud_positions: BTreeMap::new(),
+            last_save_ms: 0,
+            backup_written: false,
+            fallback: Module {
+                id: ModuleId::ClickGui,
+                key: "__fallback",
+                name: "Unavailable",
+                description: "",
+                category: Category::Client,
+                enabled: false,
+                keybind: None,
+                expanded: false,
+                show_in_arraylist: false,
+                settings: Vec::new(),
+            },
         }
+    }
+
+    pub fn bind_mode(&self, id: ModuleId) -> BindMode {
+        if self.hold_binds.contains(&id) {
+            BindMode::Hold
+        } else {
+            BindMode::Toggle
+        }
+    }
+
+    pub fn set_bind_mode(&mut self, id: ModuleId, mode: BindMode) {
+        let changed = match mode {
+            BindMode::Hold => self.hold_binds.insert(id),
+            BindMode::Toggle => self.hold_binds.remove(&id),
+        };
+        if changed {
+            self.dirty = true;
+        }
+    }
+
+    pub fn is_favorite(&self, id: ModuleId) -> bool {
+        self.favorites.contains(&id)
+    }
+
+    pub fn toggle_favorite(&mut self, id: ModuleId) {
+        if !self.favorites.remove(&id) {
+            self.favorites.insert(id);
+        }
+        self.dirty = true;
+    }
+
+    /// Restores every setting of one module to its default. Returns true if anything changed.
+    pub fn reset_module(&mut self, id: ModuleId) -> bool {
+        let Some(m) = self.modules.iter_mut().find(|m| m.id == id) else {
+            return false;
+        };
+        let mut changed = false;
+        for setting in &mut m.settings {
+            // Keybinds belong to the user, not to the module's tuning.
+            if setting.as_keybind().is_some() {
+                continue;
+            }
+            changed |= setting.reset();
+        }
+        if changed {
+            self.dirty = true;
+        }
+        changed
     }
 
     pub fn reset_panel_layout(&mut self, screen_width: f32) {
@@ -235,26 +424,25 @@ impl ModuleManager {
         self.dirty = true;
     }
 
+    /// Looks a module up by id. Every `ModuleId` is registered in `new()` (covered by a
+    /// unit test); a miss yields an inert, disabled module instead of panicking in a hook.
     pub fn get(&self, id: ModuleId) -> &Module {
         self.modules
             .iter()
             .find(|m| m.id == id)
-            .expect("registered module exists")
+            .unwrap_or(&self.fallback)
     }
 
     pub fn index_of(&self, id: ModuleId) -> usize {
-        self.modules
-            .iter()
-            .position(|m| m.id == id)
-            .expect("registered module exists")
+        self.modules.iter().position(|m| m.id == id).unwrap_or(0)
     }
 
     #[allow(dead_code)]
     pub fn get_mut(&mut self, id: ModuleId) -> &mut Module {
-        self.modules
-            .iter_mut()
-            .find(|m| m.id == id)
-            .expect("registered module exists")
+        match self.modules.iter().position(|m| m.id == id) {
+            Some(i) => &mut self.modules[i],
+            None => &mut self.fallback,
+        }
     }
 
     pub fn by_key_mut(&mut self, key: &str) -> Option<&mut Module> {
@@ -275,14 +463,20 @@ impl ModuleManager {
         now
     }
 
-    /// Toggles every module whose keybind matches `key` (returns how many toggled).
+    /// Handles a key press: toggle-bound modules flip, hold-bound modules switch on.
+    /// Returns how many modules changed state.
     pub fn trigger_keybind(&mut self, key: &str) -> usize {
         let mut count = 0;
         for m in &mut self.modules {
-            if m.id == ModuleId::ClickGui {
+            if m.id == ModuleId::ClickGui || m.keybind.as_deref() != Some(key) {
                 continue;
             }
-            if m.keybind.as_deref() == Some(key) {
+            if self.hold_binds.contains(&m.id) {
+                if !m.enabled {
+                    m.enabled = true;
+                    count += 1;
+                }
+            } else {
                 m.enabled = !m.enabled;
                 count += 1;
             }
@@ -291,6 +485,34 @@ impl ModuleManager {
             self.dirty = true;
         }
         count
+    }
+
+    /// Handles a key release: hold-bound modules switch off. Returns how many changed.
+    pub fn release_keybind(&mut self, key: &str) -> usize {
+        let mut count = 0;
+        for m in &mut self.modules {
+            if m.id == ModuleId::ClickGui
+                || !self.hold_binds.contains(&m.id)
+                || m.keybind.as_deref() != Some(key)
+            {
+                continue;
+            }
+            if m.enabled {
+                m.enabled = false;
+                count += 1;
+            }
+        }
+        if count > 0 {
+            self.dirty = true;
+        }
+        count
+    }
+
+    /// Module indices in `category` matching `filter`, favorites first.
+    pub fn sorted_indices_in_category(&self, category: Category, filter: &str) -> Vec<usize> {
+        let mut out = self.indices_in_category(category, filter);
+        out.sort_by_key(|&i| !self.favorites.contains(&self.modules[i].id));
+        out
     }
 
     /// Configured ClickGUI open/close keybind (defaults to `key.keyboard.right.shift`).
@@ -558,6 +780,171 @@ fn build_hud_module() -> Module {
                 "Draw a colored accent bar along the edge of each active module.",
                 true,
             ),
+            Setting::bool(
+                "show_fps",
+                "FPS",
+                "Show the current frame rate in the info panel.",
+                false,
+            )
+            .group("Info Panel (drag to move)"),
+            Setting::bool(
+                "show_ping",
+                "Ping",
+                "Show your latency to the server in the info panel.",
+                false,
+            ),
+            Setting::bool(
+                "show_speed",
+                "Speed",
+                "Show your horizontal speed in blocks per second.",
+                false,
+            ),
+            Setting::bool(
+                "show_armor",
+                "Armor",
+                "Show the average remaining durability of your worn armor.",
+                false,
+            ),
+            Setting::bool(
+                "show_compass",
+                "Compass",
+                "Show the compass direction and heading you are facing.",
+                false,
+            ),
+            Setting::bool(
+                "show_session",
+                "Session Timer",
+                "Show how long you have been playing this session.",
+                false,
+            ),
+            Setting::bool(
+                "keystrokes",
+                "Keystrokes",
+                "Show WASD, jump and mouse buttons with live clicks per second.",
+                false,
+            )
+            .group("Widgets (drag to move)"),
+            Setting::bool(
+                "toasts",
+                "Notifications",
+                "Show brief messages when modules toggle, profiles load, or errors are recovered.",
+                true,
+            )
+            .group("Notifications"),
         ],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_module_id_is_registered_exactly_once() {
+        let mgr = ModuleManager::new();
+        for id in ModuleId::ALL {
+            let count = mgr.modules.iter().filter(|m| m.id == id).count();
+            assert_eq!(count, 1, "{id:?} registered {count} times");
+        }
+        assert_eq!(mgr.modules.len(), ModuleId::ALL.len());
+    }
+
+    #[test]
+    fn module_keys_and_setting_ids_are_unique() {
+        let mgr = ModuleManager::new();
+        let mut keys = HashSet::new();
+        for m in &mgr.modules {
+            assert!(keys.insert(m.key), "duplicate module key {}", m.key);
+            let mut ids = HashSet::new();
+            for s in &m.settings {
+                assert!(ids.insert(s.id), "{}: duplicate setting id {}", m.key, s.id);
+            }
+        }
+    }
+
+    #[test]
+    fn lookups_never_panic() {
+        let mut mgr = ModuleManager::new();
+        mgr.modules.clear();
+        assert!(!mgr.get(ModuleId::Radar).enabled);
+        assert!(!mgr.is_enabled(ModuleId::Sprint));
+        // A miss on the mutable path hands back the inert fallback instead of panicking.
+        let _ = mgr.get_mut(ModuleId::Sprint);
+        assert!(mgr.by_key_mut("sprint").is_none());
+        assert!(!mgr.reset_module(ModuleId::Radar));
+    }
+
+    #[test]
+    fn toggle_bind_flips_and_hold_bind_follows_the_key() {
+        let mut mgr = ModuleManager::new();
+        mgr.get_mut(ModuleId::Radar).keybind = Some("key.keyboard.g".to_owned());
+        mgr.get_mut(ModuleId::Sprint).keybind = Some("key.keyboard.g".to_owned());
+        mgr.set_bind_mode(ModuleId::Sprint, BindMode::Hold);
+
+        assert_eq!(mgr.trigger_keybind("key.keyboard.g"), 2);
+        assert!(mgr.is_enabled(ModuleId::Radar) && mgr.is_enabled(ModuleId::Sprint));
+        // Key repeat / double press: hold stays on, toggle flips back.
+        assert_eq!(mgr.trigger_keybind("key.keyboard.g"), 1);
+        assert!(!mgr.is_enabled(ModuleId::Radar) && mgr.is_enabled(ModuleId::Sprint));
+
+        assert_eq!(mgr.release_keybind("key.keyboard.g"), 1);
+        assert!(!mgr.is_enabled(ModuleId::Sprint));
+        // Releasing never touches toggle-bound modules.
+        mgr.trigger_keybind("key.keyboard.g");
+        assert!(mgr.is_enabled(ModuleId::Radar));
+        mgr.release_keybind("key.keyboard.g");
+        assert!(mgr.is_enabled(ModuleId::Radar));
+        assert_eq!(mgr.trigger_keybind("key.keyboard.unbound"), 0);
+    }
+
+    #[test]
+    fn bind_mode_helpers_round_trip() {
+        assert_eq!(BindMode::from_id(BindMode::Hold.id()), Some(BindMode::Hold));
+        assert_eq!(BindMode::from_id("bogus"), None);
+        assert_eq!(BindMode::Toggle.flipped(), BindMode::Hold);
+        assert_eq!(BindMode::Hold.flipped(), BindMode::Toggle);
+    }
+
+    #[test]
+    fn favorites_sort_first_and_search_still_filters() {
+        let mut mgr = ModuleManager::new();
+        let render: Vec<ModuleId> = mgr
+            .indices_in_category(Category::Render, "")
+            .iter()
+            .map(|&i| mgr.modules[i].id)
+            .collect();
+        assert!(render.len() >= 2);
+        let last = *render.last().expect("render panel is not empty");
+        mgr.toggle_favorite(last);
+        let sorted = mgr.sorted_indices_in_category(Category::Render, "");
+        assert_eq!(mgr.modules[sorted[0]].id, last);
+        assert_eq!(sorted.len(), render.len());
+
+        let filtered = mgr.sorted_indices_in_category(Category::Render, "zzzz-no-such-module");
+        assert!(filtered.is_empty());
+        mgr.toggle_favorite(last);
+        assert!(!mgr.is_favorite(last));
+    }
+
+    #[test]
+    fn reset_module_restores_settings_but_keeps_keybind() {
+        let mut mgr = ModuleManager::new();
+        mgr.get_mut(ModuleId::AimAssist).keybind = Some("key.keyboard.r".to_owned());
+        let default_range = mgr.get(ModuleId::AimAssist).float("range", 0.0);
+        mgr.get_mut(ModuleId::AimAssist)
+            .setting_mut("range")
+            .expect("aim assist has a range")
+            .deserialize_value("3.0");
+        assert!((mgr.get(ModuleId::AimAssist).float("range", 0.0) - 3.0).abs() < 1e-6);
+        mgr.dirty = false;
+
+        assert!(mgr.reset_module(ModuleId::AimAssist));
+        assert!(mgr.dirty);
+        assert!((mgr.get(ModuleId::AimAssist).float("range", 0.0) - default_range).abs() < 1e-6);
+        assert_eq!(
+            mgr.get(ModuleId::AimAssist).keybind.as_deref(),
+            Some("key.keyboard.r")
+        );
+        assert!(!mgr.reset_module(ModuleId::AimAssist), "already at defaults");
     }
 }

@@ -1,7 +1,7 @@
 //! Meteor-inspired ClickGUI rendered on Horizon's mod screen (`host.mod_screen_open("star")`).
 //!
 //! Features:
-//! - Top navigation tabs: `Modules` | `Settings` | `HUD`
+//! - Top navigation tabs: `Modules` | `Settings` | `HUD` | `Profiles`
 //! - Draggable, collapsible, scrollable category panels on the `Modules` tab
 //! - Dedicated centered settings cards for Client Settings (Theme, Font, Layout, Colors) & HUD
 //! - Reusable floating Entity Selector modal window for exact entity-type filtering
@@ -12,7 +12,9 @@ use mod_api::{ClientHost, DrawContext};
 
 use crate::entity_filter::{self, EntityGroup};
 use crate::font::{FontConfig, FontFace};
-use crate::module::{Category, ModuleId, ModuleManager};
+use crate::hud;
+use crate::module::{BindMode, Category, ModuleId, ModuleManager};
+use crate::modules::trackers::Trackers;
 use crate::settings::{SettingKind, format_key_name};
 use crate::theme::{Theme, with_alpha};
 
@@ -23,22 +25,35 @@ const SETTING_H: f32 = 16.0;
 const GROUP_H: f32 = 14.0;
 const COLOR_CHANNEL_H: f32 = 13.0;
 const COLOR_DRAWER_H: f32 = COLOR_CHANNEL_H * 4.0 + 4.0;
+/// Rows above a module's own settings: Bind, Bind Mode, Favorite and Reset Module.
+const MODULE_META_ROWS: f32 = 4.0;
+
+/// Clipboard work the GUI cannot do itself because it has no host access.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClipboardAction {
+    /// Copy the whole setup to the clipboard.
+    Export,
+    /// Replace the setup with the config on the clipboard.
+    Import,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GuiTab {
     Modules,
     Settings,
     Hud,
+    Profiles,
 }
 
 impl GuiTab {
-    const ALL: [GuiTab; 3] = [GuiTab::Modules, GuiTab::Settings, GuiTab::Hud];
+    const ALL: [GuiTab; 4] = [GuiTab::Modules, GuiTab::Settings, GuiTab::Hud, GuiTab::Profiles];
 
     fn label(self) -> &'static str {
         match self {
             Self::Modules => "Modules",
             Self::Settings => "Settings",
             Self::Hud => "HUD",
+            Self::Profiles => "Profiles",
         }
     }
 }
@@ -60,6 +75,14 @@ enum PickerFilter {
     All,
     Selected,
     Group(EntityGroup),
+}
+
+/// Destructive action waiting on the confirmation dialog.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ConfirmKind {
+    ResetAll,
+    DeleteProfile(String),
+    LoadProfile(String),
 }
 
 /// Interactive state for an open floating dropdown popover (Font, Theme, Mode settings).
@@ -88,13 +111,20 @@ pub struct ClickGuiState {
     last_frame_ms: Option<u64>,
     settings_scroll: f32,
     hud_scroll: f32,
+    profile_name: String,
+    profile_name_focused: bool,
+    profile_error: Option<String>,
+    profile_scroll: f32,
+    confirm: Option<ConfirmKind>,
     hits: Vec<HitRegion>,
     panel_rects: Vec<(Category, [f32; 4], f32)>,
     card_scroll_rect: Option<([f32; 4], f32)>,
+    profile_list_rect: Option<([f32; 4], f32)>,
     picker_list_rect: Option<([f32; 4], f32)>,
     picker_window_rect: Option<[f32; 4]>,
     dropdown_list_rect: Option<([f32; 4], f32)>,
     hovered_tooltip: Option<String>,
+    pending_clipboard: Option<ClipboardAction>,
 }
 
 impl Default for ClickGuiState {
@@ -114,13 +144,20 @@ impl Default for ClickGuiState {
             last_frame_ms: None,
             settings_scroll: 0.0,
             hud_scroll: 0.0,
+            profile_name: String::new(),
+            profile_name_focused: false,
+            profile_error: None,
+            profile_scroll: 0.0,
+            confirm: None,
             hits: Vec::new(),
             panel_rects: Vec::new(),
             card_scroll_rect: None,
+            profile_list_rect: None,
             picker_list_rect: None,
             picker_window_rect: None,
             dropdown_list_rect: None,
             hovered_tooltip: None,
+            pending_clipboard: None,
         }
     }
 }
@@ -145,6 +182,19 @@ enum DragTarget {
         x: f32,
         w: f32,
     },
+    /// A HUD widget being repositioned on the HUD tab.
+    Widget {
+        id: &'static str,
+        offset: [f32; 2],
+        size: [f32; 2],
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ButtonTone {
+    Normal,
+    Accent,
+    Danger,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -170,6 +220,12 @@ enum HitKind {
     PanelCollapse(Category),
     ModuleRow(usize),
     ModuleBind(usize),
+    ModuleBindMode(usize),
+    ModuleFavorite(usize),
+    ModuleReset(usize),
+    HudWidget { id: &'static str, rect: [f32; 4] },
+    ConfigExport,
+    ConfigImport,
     ToggleModuleEnabled(usize),
     SettingBool { mod_idx: usize, set_idx: usize },
     SettingSlider { mod_idx: usize, set_idx: usize },
@@ -179,6 +235,16 @@ enum HitKind {
     SettingColorChannel { mod_idx: usize, set_idx: usize, channel: u8 },
     SettingKeybind { mod_idx: usize, set_idx: usize },
     SettingEntityFilter { mod_idx: usize, set_idx: usize },
+    ProfileName,
+    ProfileCreate,
+    ProfileLoad(String),
+    ProfileSave(String),
+    ProfileDelete(String),
+    ResetAll,
+    ConfirmAccept,
+    ConfirmCancel,
+    ConfirmScrim,
+    ConfirmDismiss,
     // Entity picker modal hits
     PickerClose,
     PickerSearchBar,
@@ -195,12 +261,20 @@ impl ClickGuiState {
         self.listening_bind.is_some()
     }
 
+    /// The clipboard request queued by the last click, if any.
+    pub fn take_clipboard_action(&mut self) -> Option<ClipboardAction> {
+        self.pending_clipboard.take()
+    }
+
     pub fn on_close(&mut self) {
+        self.pending_clipboard = None;
         self.dragging = None;
         self.listening_bind = None;
         self.search_focused = false;
         self.entity_picker = None;
         self.open_dropdown = None;
+        self.confirm = None;
+        self.profile_name_focused = false;
         self.last_frame_ms = None;
     }
 
@@ -245,6 +319,7 @@ impl ClickGuiState {
         draw: &mut dyn DrawContext,
         mouse: [f32; 2],
         manager: &mut ModuleManager,
+        trackers: &Trackers,
     ) {
         let size = draw.size();
         self.screen_size = size;
@@ -281,13 +356,17 @@ impl ClickGuiState {
         self.hits.clear();
         self.panel_rects.clear();
         self.card_scroll_rect = None;
+        self.profile_list_rect = None;
         self.picker_list_rect = None;
         self.picker_window_rect = None;
         self.dropdown_list_rect = None;
         self.hovered_tooltip = None;
 
         // When a modal or dropdown popover is open, suppress hover on background elements.
-        let bg_mouse = if self.entity_picker.is_some() || self.open_dropdown.is_some() {
+        let bg_mouse = if self.entity_picker.is_some()
+            || self.open_dropdown.is_some()
+            || self.confirm.is_some()
+        {
             [-9999.0, -9999.0]
         } else {
             mouse
@@ -318,6 +397,8 @@ impl ClickGuiState {
                 );
             }
             GuiTab::Hud => {
+                // Widget outlines go first so the settings card wins clicks where they overlap.
+                self.render_widget_editor(host, draw, size, bg_mouse, manager, trackers, &theme, font);
                 let idx = manager.index_of(ModuleId::Hud);
                 self.render_settings_card(
                     draw,
@@ -332,11 +413,17 @@ impl ClickGuiState {
                     font,
                 );
             }
+            GuiTab::Profiles => {
+                self.render_profiles(draw, size, bg_mouse, manager, &theme, font);
+            }
         }
 
         self.render_footer(draw, size, &theme, font);
 
-        if self.entity_picker.is_some() {
+        if self.confirm.is_some() {
+            self.hits.clear();
+            self.render_confirm(draw, size, mouse, &theme, font);
+        } else if self.entity_picker.is_some() {
             // Clear background hits so modal captures all interactions cleanly.
             self.hits.clear();
             self.render_entity_picker(draw, size, mouse, manager, &theme, font);
@@ -353,6 +440,106 @@ impl ClickGuiState {
             if let Some(tip) = tip {
                 self.render_tooltip(draw, size, mouse, &tip, &theme, font);
             }
+        }
+    }
+
+    /// Outlines every movable HUD widget so it can be dragged to a new spot.
+    #[allow(clippy::too_many_arguments)]
+    fn render_widget_editor(
+        &mut self,
+        host: &dyn ClientHost,
+        draw: &mut dyn DrawContext,
+        size: [f32; 2],
+        mouse: [f32; 2],
+        manager: &ModuleManager,
+        trackers: &Trackers,
+        theme: &Theme,
+        font: FontConfig,
+    ) {
+        let widgets = hud::widget_rects(host, &*draw, manager, trackers);
+        if widgets.is_empty() {
+            let hint = "No movable widgets are on. Turn on Radar, Keystrokes or an Info Panel option.";
+            let hw = font.width(draw, hint, false);
+            let y = size[1] - FOOTER_H - 22.0;
+            font.draw_body(
+                draw,
+                hint,
+                [((size[0] - hw) * 0.5).max(4.0), font.center_y(y, 12.0)],
+                theme.text_muted,
+            );
+            return;
+        }
+        for widget in widgets {
+            let rect = widget.rect;
+            let hover = rect_contains(rect, mouse);
+            let dragging = matches!(
+                self.dragging,
+                Some(DragTarget::Widget { id, .. }) if id == widget.id
+            );
+            let fill = if dragging {
+                with_alpha(theme.accent, 0x44)
+            } else if hover {
+                with_alpha(theme.accent, 0x28)
+            } else {
+                with_alpha(theme.accent, 0x14)
+            };
+            draw.fill(rect, fill);
+            draw_outline(draw, rect, if hover || dragging { theme.accent } else { theme.border });
+            let label = widget.label;
+            let lw = font.width(draw, label, font.bold_headers);
+            let ly = (rect[1] - font.line_height() - 4.0).max(TOP_BAR_H + 2.0);
+            draw.fill(
+                [rect[0], ly - 1.0, lw + 8.0, font.line_height() + 3.0],
+                with_alpha(theme.header_bg, 0xE0),
+            );
+            font.draw_header(draw, label, [rect[0] + 4.0, ly], theme.accent);
+            self.hits.push(HitRegion {
+                rect,
+                kind: HitKind::HudWidget { id: widget.id, rect },
+                tooltip: Some("Drag to move. Right-click to put it back in its default spot.".into()),
+            });
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn paint_meta_row(
+        &mut self,
+        draw: &mut dyn DrawContext,
+        rect: [f32; 4],
+        clip: [f32; 4],
+        mouse: [f32; 2],
+        label: &str,
+        value: &str,
+        highlight: bool,
+        kind: HitKind,
+        tip: &str,
+        theme: &Theme,
+        font: FontConfig,
+    ) {
+        let visible = rect[1] + rect[3] > clip[1] && rect[1] < clip[1] + clip[3];
+        if !visible {
+            return;
+        }
+        let hover = rect_contains(clip, mouse) && rect_contains(rect, mouse);
+        if hover {
+            draw.fill(rect, theme.module_hover);
+            self.hovered_tooltip = Some(tip.to_owned());
+        }
+        let ty = font.center_y(rect[1], rect[3]);
+        font.draw_body(draw, label, [rect[0] + 7.0, ty], theme.text_muted);
+        let vw = font.width(draw, value, false);
+        font.draw_value(
+            draw,
+            value,
+            [rect[0] + rect[2] - 7.0 - vw, ty],
+            if highlight { theme.accent } else { theme.text },
+        );
+        if let Some(hit) = intersect_rects(rect, clip) {
+            self.hits.push(HitRegion {
+                rect: hit,
+                kind,
+                tooltip: None,
+            });
         }
     }
 
@@ -374,7 +561,7 @@ impl ClickGuiState {
 
         // Brand title on left
         let title = "STAR";
-        let ver = "v0.2.6";
+        let ver = concat!("v", env!("CARGO_PKG_VERSION"));
         let ty = font.center_y(0.0, TOP_BAR_H - 1.0);
         font.draw_header(draw, title, [10.0, ty], theme.accent);
         let title_w = font.width(draw, title, font.bold_headers);
@@ -572,7 +759,11 @@ impl ClickGuiState {
         let py = panel.y;
         let collapsed = panel.collapsed;
 
-        let mod_indices = manager.indices_in_category(category, &self.search);
+        let mod_indices = manager.sorted_indices_in_category(category, &self.search);
+        // While searching, panels without a match get out of the way.
+        if !self.search.trim().is_empty() && mod_indices.is_empty() {
+            return;
+        }
         let content_h = if mod_indices.is_empty() {
             row_h + 6.0
         } else {
@@ -762,11 +953,16 @@ impl ClickGuiState {
                         );
                     }
 
-                    let name_max_w = (right_edge - (px + 10.0)).max(20.0);
+                    let mut name_x = px + 7.0;
+                    if manager.is_favorite(manager.modules[idx].id) {
+                        font.draw_header(draw, "*", [name_x, text_y], theme.accent);
+                        name_x += font.width(draw, "*", font.bold_headers) + 3.0;
+                    }
+                    let name_max_w = (right_edge - (name_x + 3.0)).max(20.0);
                     font.draw_fitted(
                         draw,
                         mod_name,
-                        [px + 7.0, text_y],
+                        [name_x, text_y],
                         name_max_w,
                         if enabled { theme.text } else { theme.text_muted },
                         false,
@@ -1013,6 +1209,48 @@ impl ClickGuiState {
                 }
             }
             y += SETTING_H;
+
+            let mode = manager.bind_mode(m.id);
+            let favorite = manager.is_favorite(m.id);
+            let meta_rows: [(&str, &str, bool, HitKind, &str); 3] = [
+                (
+                    "Bind Mode",
+                    mode.label(),
+                    mode == BindMode::Hold,
+                    HitKind::ModuleBindMode(mod_idx),
+                    "Toggle: each press flips the module. Hold: it is on only while the key is held.",
+                ),
+                (
+                    "Favorite",
+                    if favorite { "On" } else { "Off" },
+                    favorite,
+                    HitKind::ModuleFavorite(mod_idx),
+                    "Favorites are pinned to the top of their panel and marked with a star.",
+                ),
+                (
+                    "Reset Module",
+                    "Reset",
+                    false,
+                    HitKind::ModuleReset(mod_idx),
+                    "Restore this module's settings to their defaults. Your keybinds are kept.",
+                ),
+            ];
+            for (label, value, highlight, kind, tip) in meta_rows {
+                self.paint_meta_row(
+                    draw,
+                    [px, y, w, SETTING_H],
+                    clip,
+                    mouse,
+                    label,
+                    value,
+                    highlight,
+                    kind,
+                    tip,
+                    theme,
+                    font,
+                );
+                y += SETTING_H;
+            }
         }
 
         let mut last_group: Option<&str> = None;
@@ -1944,10 +2182,16 @@ impl ClickGuiState {
     ) {
         let hint = if self.entity_picker.is_some() {
             "Click entities to toggle  |  Scroll to browse  |  ESC Close Picker"
+        } else if self.confirm.is_some() {
+            "Enter Confirm  |  ESC Cancel"
         } else if self.listening_bind.is_some() {
             "Press any key or mouse button to bind  |  ESC / Backspace / RMB clear"
         } else if self.active_tab == GuiTab::Modules {
             "LMB Toggle  |  RMB Settings / Reset  |  MMB Bind  |  Scroll Adjust  |  ESC Close"
+        } else if self.active_tab == GuiTab::Profiles {
+            "Create, load, and save profiles  |  Copy / Paste shares a config  |  ESC Close"
+        } else if self.active_tab == GuiTab::Hud {
+            "Drag a widget outline to move it  |  RMB resets it  |  LMB Toggle  |  ESC Close"
         } else {
             "LMB Toggle / Drag Slider  |  RMB Reset Setting  |  Scroll to browse  |  ESC Close"
         };
@@ -1985,6 +2229,483 @@ impl ClickGuiState {
         font.draw_body(draw, text, [x + 6.0, font.center_y(y, h)], theme.text);
     }
 
+    fn render_profiles(
+        &mut self,
+        draw: &mut dyn DrawContext,
+        size: [f32; 2],
+        mouse: [f32; 2],
+        manager: &ModuleManager,
+        theme: &Theme,
+        font: FontConfig,
+    ) {
+        let card_w = (size[0] - 40.0).clamp(260.0, 430.0);
+        let card_h = (size[1] - TOP_BAR_H - FOOTER_H - 24.0).clamp(140.0, 440.0);
+        let card_x = (size[0] - card_w) * 0.5;
+        let card_y = TOP_BAR_H + 12.0;
+        let card = [card_x, card_y, card_w, card_h];
+
+        draw.fill([card_x + 3.0, card_y + 3.0, card_w, card_h], 0x5500_0000);
+        draw.fill([card_x, card_y, card_w, 30.0], theme.header_bg);
+        draw.fill([card_x, card_y, card_w, 2.0], theme.accent);
+        font.draw_header(draw, "Profiles", [card_x + 10.0, card_y + 6.0], theme.text);
+        font.draw_fitted(
+            draw,
+            "Save modules, keybinds, and settings. Load asks before replacing them.",
+            [card_x + 10.0, card_y + 17.5],
+            card_w - 20.0,
+            theme.text_muted,
+            false,
+            false,
+        );
+        draw.fill([card_x, card_y + 30.0, card_w, card_h - 30.0], theme.panel_bg);
+        draw_outline(draw, card, theme.border);
+
+        let inner_x = card_x + 8.0;
+        let inner_w = card_w - 16.0;
+        let mut y = card_y + 38.0;
+        let field_h = 16.0;
+        let create_w = font.width(draw, "Create", false) + 14.0;
+        let field_w = (inner_w - create_w - 6.0).max(48.0);
+        let field = [inner_x, y, field_w, field_h];
+        let field_hover = rect_contains(field, mouse);
+        draw.fill(
+            field,
+            if self.profile_name_focused || field_hover {
+                theme.module_hover
+            } else {
+                theme.setting_bg
+            },
+        );
+        draw_outline(
+            draw,
+            field,
+            if self.profile_name_focused {
+                theme.accent
+            } else {
+                theme.border
+            },
+        );
+        let shown = if self.profile_name_focused {
+            format!("{}|", self.profile_name)
+        } else if self.profile_name.is_empty() {
+            "Profile name".to_owned()
+        } else {
+            self.profile_name.clone()
+        };
+        let field_color = if self.profile_name.is_empty() && !self.profile_name_focused {
+            theme.text_muted
+        } else {
+            theme.text
+        };
+        font.draw_fitted(
+            draw,
+            &shown,
+            [inner_x + 5.0, font.center_y(y, field_h)],
+            field_w - 10.0,
+            field_color,
+            false,
+            false,
+        );
+        self.hits.push(HitRegion {
+            rect: field,
+            kind: HitKind::ProfileName,
+            tooltip: Some("Letters, numbers, spaces, - and _. Enter creates the profile.".into()),
+        });
+        self.paint_button(
+            draw,
+            font,
+            theme,
+            [inner_x + field_w + 6.0, y, create_w, field_h],
+            "Create",
+            mouse,
+            true,
+            ButtonTone::Accent,
+            HitKind::ProfileCreate,
+            Some("Save the current setup as a new profile.".into()),
+            None,
+        );
+
+        y += field_h + 3.0;
+        if let Some(err) = &self.profile_error {
+            font.draw_fitted(
+                draw,
+                err,
+                [inner_x, y],
+                inner_w,
+                0xFFFF_8A8A,
+                false,
+                false,
+            );
+            y += 13.0;
+        }
+
+        let active = if manager.active_profile.is_empty() {
+            "Active: unsaved".to_owned()
+        } else {
+            format!("Active: {}", manager.active_profile)
+        };
+        font.draw_body(draw, &active, [inner_x, y], theme.text_muted);
+        y += 15.0;
+
+        let reset_h = 18.0;
+        let reset_y = card_y + card_h - reset_h - 8.0;
+        let io_y = reset_y - reset_h - 4.0;
+        let list_h = (io_y - 6.0 - y).max(22.0);
+        let list = [inner_x, y, inner_w, list_h];
+        let row_h = 18.0;
+        let content_h = if manager.profiles.is_empty() {
+            row_h
+        } else {
+            manager.profiles.len() as f32 * row_h
+        };
+        let max_scroll = (content_h - list_h).max(0.0);
+        self.profile_scroll = self.profile_scroll.clamp(0.0, max_scroll);
+        self.profile_list_rect = Some((list, max_scroll));
+
+        draw.fill(list, theme.setting_bg);
+        let clipped = draw.push_clip(list).is_ok();
+        if manager.profiles.is_empty() {
+            font.draw_fitted(
+                draw,
+                "No profiles yet.",
+                [inner_x + 6.0, font.center_y(y, row_h)],
+                inner_w - 12.0,
+                theme.text_muted,
+                false,
+                false,
+            );
+        } else {
+            let mut row_y = y - self.profile_scroll;
+            for profile in &manager.profiles {
+                let row = [inner_x, row_y, inner_w, row_h];
+                let visible = row_y + row_h > list[1] && row_y < list[1] + list[3];
+                if visible {
+                    let active_row = profile.name == manager.active_profile;
+                    let hover = rect_contains(list, mouse) && rect_contains(row, mouse);
+                    if active_row {
+                        draw.fill(row, with_alpha(theme.accent, 0x28));
+                    } else if hover {
+                        draw.fill(row, theme.module_hover);
+                    }
+                    let delete_w = font.width(draw, "Delete", false) + 12.0;
+                    let save_w = font.width(draw, "Save", false) + 12.0;
+                    let load_w = font.width(draw, "Load", false) + 12.0;
+                    let btn_h = 14.0;
+                    let btn_y = row_y + (row_h - btn_h) * 0.5;
+                    let delete_x = inner_x + inner_w - delete_w - 4.0;
+                    let save_x = delete_x - 4.0 - save_w;
+                    let load_x = save_x - 4.0 - load_w;
+                    font.draw_fitted(
+                        draw,
+                        &profile.name,
+                        [inner_x + 6.0, font.center_y(row_y, row_h)],
+                        (load_x - inner_x - 10.0).max(24.0),
+                        if active_row { theme.text } else { theme.text_muted },
+                        false,
+                        false,
+                    );
+                    let name = profile.name.clone();
+                    self.paint_button(
+                        draw,
+                        font,
+                        theme,
+                        [load_x, btn_y, load_w, btn_h],
+                        "Load",
+                        mouse,
+                        true,
+                        ButtonTone::Normal,
+                        HitKind::ProfileLoad(name.clone()),
+                        Some("Replace the current setup with this profile. Asks first.".into()),
+                        Some(list),
+                    );
+                    self.paint_button(
+                        draw,
+                        font,
+                        theme,
+                        [save_x, btn_y, save_w, btn_h],
+                        "Save",
+                        mouse,
+                        true,
+                        ButtonTone::Normal,
+                        HitKind::ProfileSave(name.clone()),
+                        Some("Overwrite this profile with the current setup.".into()),
+                        Some(list),
+                    );
+                    self.paint_button(
+                        draw,
+                        font,
+                        theme,
+                        [delete_x, btn_y, delete_w, btn_h],
+                        "Delete",
+                        mouse,
+                        true,
+                        ButtonTone::Danger,
+                        HitKind::ProfileDelete(name),
+                        Some("Delete this profile. Asks first.".into()),
+                        Some(list),
+                    );
+                }
+                row_y += row_h;
+            }
+        }
+        if clipped {
+            let _ = draw.pop_clip();
+        }
+        if max_scroll > 0.5 {
+            let thumb_h = ((list_h / content_h) * list_h).clamp(14.0, list_h);
+            let thumb_y = list[1] + (self.profile_scroll / max_scroll) * (list_h - thumb_h);
+            draw.fill(
+                [inner_x + inner_w - 3.0, thumb_y, 2.0, thumb_h],
+                with_alpha(theme.accent, 0xC4),
+            );
+        }
+
+        let half_w = (inner_w - 4.0) * 0.5;
+        self.paint_button(
+            draw,
+            font,
+            theme,
+            [inner_x, io_y, half_w, reset_h],
+            "Copy Config",
+            mouse,
+            true,
+            ButtonTone::Normal,
+            HitKind::ConfigExport,
+            Some("Copy your whole setup to the clipboard to share or back up.".into()),
+            None,
+        );
+        self.paint_button(
+            draw,
+            font,
+            theme,
+            [inner_x + half_w + 4.0, io_y, half_w, reset_h],
+            "Paste Config",
+            mouse,
+            true,
+            ButtonTone::Normal,
+            HitKind::ConfigImport,
+            Some("Replace your setup with a config copied from the clipboard.".into()),
+            None,
+        );
+        self.paint_button(
+            draw,
+            font,
+            theme,
+            [inner_x, reset_y, inner_w, reset_h],
+            "Reset Everything to Default",
+            mouse,
+            true,
+            ButtonTone::Danger,
+            HitKind::ResetAll,
+            Some(
+                "Restore every module, keybind, setting, and panel position. Saved profiles stay."
+                    .into(),
+            ),
+            None,
+        );
+    }
+
+    fn render_confirm(
+        &mut self,
+        draw: &mut dyn DrawContext,
+        size: [f32; 2],
+        mouse: [f32; 2],
+        theme: &Theme,
+        font: FontConfig,
+    ) {
+        let Some(kind) = self.confirm.clone() else {
+            return;
+        };
+        draw.fill([0.0, 0.0, size[0], size[1]], 0x9900_0000);
+        self.hits.push(HitRegion {
+            rect: [0.0, 0.0, size[0], size[1]],
+            kind: HitKind::ConfirmDismiss,
+            tooltip: None,
+        });
+
+        let (title, line1, line2, accept, tone) = match &kind {
+            ConfirmKind::ResetAll => (
+                "Reset everything?",
+                "Modules, keybinds, settings, and panel layout".to_owned(),
+                "return to defaults. Saved profiles are kept.".to_owned(),
+                "Reset",
+                ButtonTone::Danger,
+            ),
+            ConfirmKind::DeleteProfile(name) => (
+                "Delete profile?",
+                format!("Delete \"{name}\"?"),
+                "This cannot be undone.".to_owned(),
+                "Delete",
+                ButtonTone::Danger,
+            ),
+            ConfirmKind::LoadProfile(name) => (
+                "Load profile?",
+                format!("Load \"{name}\"?"),
+                "Current modules, keybinds, and settings will be replaced.".to_owned(),
+                "Load",
+                ButtonTone::Accent,
+            ),
+        };
+
+        let w = 328.0_f32.min((size[0] - 24.0).max(180.0));
+        let h = 112.0;
+        let x = (size[0] - w) * 0.5;
+        let y = ((size[1] - h) * 0.5).max(TOP_BAR_H + 4.0);
+        let dialog = [x, y, w, h];
+        draw.fill([x + 3.0, y + 3.0, w, h], 0x6600_0000);
+        draw.fill(dialog, theme.panel_bg);
+        draw.fill([x, y, w, 2.0], theme.accent);
+        draw_outline(draw, dialog, theme.border);
+        self.hits.push(HitRegion {
+            rect: dialog,
+            kind: HitKind::ConfirmScrim,
+            tooltip: None,
+        });
+        font.draw_header(draw, title, [x + 12.0, y + 8.0], theme.text);
+        font.draw_fitted(
+            draw,
+            &line1,
+            [x + 12.0, y + 28.0],
+            w - 24.0,
+            theme.text_muted,
+            false,
+            false,
+        );
+        font.draw_fitted(
+            draw,
+            &line2,
+            [x + 12.0, y + 42.0],
+            w - 24.0,
+            theme.text_muted,
+            false,
+            false,
+        );
+
+        let btn_h = 16.0;
+        let btn_y = y + h - btn_h - 10.0;
+        let accept_w = font.width(draw, accept, false) + 16.0;
+        let cancel_w = font.width(draw, "Cancel", false) + 16.0;
+        let accept_x = x + w - accept_w - 10.0;
+        let cancel_x = accept_x - cancel_w - 6.0;
+        self.paint_button(
+            draw,
+            font,
+            theme,
+            [cancel_x, btn_y, cancel_w, btn_h],
+            "Cancel",
+            mouse,
+            true,
+            ButtonTone::Normal,
+            HitKind::ConfirmCancel,
+            None,
+            None,
+        );
+        self.paint_button(
+            draw,
+            font,
+            theme,
+            [accept_x, btn_y, accept_w, btn_h],
+            accept,
+            mouse,
+            true,
+            tone,
+            HitKind::ConfirmAccept,
+            Some("Confirm this action.".into()),
+            None,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn paint_button(
+        &mut self,
+        draw: &mut dyn DrawContext,
+        font: FontConfig,
+        theme: &Theme,
+        rect: [f32; 4],
+        label: &str,
+        mouse: [f32; 2],
+        enabled: bool,
+        tone: ButtonTone,
+        kind: HitKind,
+        tooltip: Option<String>,
+        clip: Option<[f32; 4]>,
+    ) {
+        let hover = enabled
+            && rect_contains(rect, mouse)
+            && clip.is_none_or(|c| rect_contains(c, mouse));
+        let (fill, text) = match (tone, enabled, hover) {
+            (ButtonTone::Danger, true, true) => (0xFFB0_3A3A, 0xFFFF_FFFF),
+            (ButtonTone::Danger, true, false) => (0xFF6E_3030, 0xFFFF_E8E8),
+            (ButtonTone::Accent, true, true) => (theme.accent, 0xFFFF_FFFF),
+            (ButtonTone::Accent, true, false) => (with_alpha(theme.accent, 0xCC), 0xFFFF_FFFF),
+            (_, true, true) => (theme.module_hover, theme.text),
+            _ => (theme.setting_bg, theme.text_muted),
+        };
+        draw.fill(rect, fill);
+        draw_outline(
+            draw,
+            rect,
+            if hover && tone == ButtonTone::Normal {
+                theme.accent
+            } else {
+                theme.border
+            },
+        );
+        let lw = font.width(draw, label, false);
+        font.draw_body(
+            draw,
+            label,
+            [
+                rect[0] + (rect[2] - lw) * 0.5,
+                font.center_y(rect[1], rect[3]),
+            ],
+            text,
+        );
+        if enabled {
+            let hit_rect = match clip {
+                Some(c) => intersect_rects(rect, c),
+                None => Some(rect),
+            };
+            if let Some(hit_rect) = hit_rect {
+                self.hits.push(HitRegion {
+                    rect: hit_rect,
+                    kind,
+                    tooltip,
+                });
+            }
+        }
+    }
+
+    fn try_create_profile(&mut self, manager: &mut ModuleManager) {
+        match crate::config::create_profile(manager, &self.profile_name) {
+            Ok(()) => {
+                self.profile_name.clear();
+                self.profile_error = None;
+                self.profile_name_focused = false;
+            }
+            Err(msg) => self.profile_error = Some(msg.to_owned()),
+        }
+    }
+
+    fn apply_confirm(&mut self, manager: &mut ModuleManager) {
+        let Some(kind) = self.confirm.take() else {
+            return;
+        };
+        match kind {
+            ConfirmKind::ResetAll => {
+                crate::config::reset_everything(manager, self.screen_size[0]);
+            }
+            ConfirmKind::DeleteProfile(name) => {
+                crate::config::delete_profile(manager, &name);
+            }
+            ConfirmKind::LoadProfile(name) => {
+                crate::config::load_profile(manager, &name);
+                self.listening_bind = None;
+                self.open_dropdown = None;
+            }
+        }
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // Input handlers
     // ─────────────────────────────────────────────────────────────────────────
@@ -1996,8 +2717,26 @@ impl ClickGuiState {
         manager: &mut ModuleManager,
     ) -> bool {
         self.search_focused = false;
+        self.profile_name_focused = false;
         if let Some(p) = &mut self.entity_picker {
             p.search_focused = false;
+        }
+
+        if self.confirm.is_some() {
+            let hit = self
+                .hits
+                .iter()
+                .rev()
+                .find(|h| rect_contains(h.rect, mouse))
+                .cloned();
+            match hit.map(|h| h.kind) {
+                Some(HitKind::ConfirmAccept) if button == 0 => self.apply_confirm(manager),
+                Some(HitKind::ConfirmCancel | HitKind::ConfirmDismiss) if button == 0 => {
+                    self.confirm = None;
+                }
+                _ => {}
+            }
+            return true;
         }
 
         // While capturing a keybind, mouse buttons assign (or clear with RMB).
@@ -2149,6 +2888,54 @@ impl ClickGuiState {
                 }
                 true
             }
+            HitKind::ModuleBindMode(idx) => {
+                if button == 0 {
+                    let id = manager.modules[idx].id;
+                    let next = manager.bind_mode(id).flipped();
+                    manager.set_bind_mode(id, next);
+                }
+                true
+            }
+            HitKind::ModuleFavorite(idx) => {
+                if button == 0 {
+                    let id = manager.modules[idx].id;
+                    manager.toggle_favorite(id);
+                }
+                true
+            }
+            HitKind::ModuleReset(idx) => {
+                if button == 0 {
+                    let id = manager.modules[idx].id;
+                    manager.reset_module(id);
+                    self.listening_bind = None;
+                    self.open_dropdown = None;
+                }
+                true
+            }
+            HitKind::HudWidget { id, rect } => {
+                if button == 0 {
+                    self.dragging = Some(DragTarget::Widget {
+                        id,
+                        offset: [mouse[0] - rect[0], mouse[1] - rect[1]],
+                        size: [rect[2], rect[3]],
+                    });
+                } else if button == 1 && manager.hud_positions.remove(id).is_some() {
+                    manager.dirty = true;
+                }
+                true
+            }
+            HitKind::ConfigExport => {
+                if button == 0 {
+                    self.pending_clipboard = Some(ClipboardAction::Export);
+                }
+                true
+            }
+            HitKind::ConfigImport => {
+                if button == 0 {
+                    self.pending_clipboard = Some(ClipboardAction::Import);
+                }
+                true
+            }
             HitKind::SettingBool { mod_idx, set_idx } => {
                 let setting = &mut manager.modules[mod_idx].settings[set_idx];
                 if button == 0 {
@@ -2273,6 +3060,53 @@ impl ClickGuiState {
                 }
                 true
             }
+            HitKind::ProfileName => {
+                if button == 0 {
+                    self.profile_name_focused = true;
+                } else if button == 1 {
+                    self.profile_name.clear();
+                    self.profile_error = None;
+                }
+                true
+            }
+            HitKind::ProfileCreate => {
+                if button == 0 {
+                    self.try_create_profile(manager);
+                }
+                true
+            }
+            HitKind::ProfileLoad(name) => {
+                if button == 0 {
+                    self.confirm = Some(ConfirmKind::LoadProfile(name));
+                    self.open_dropdown = None;
+                    self.listening_bind = None;
+                }
+                true
+            }
+            HitKind::ProfileSave(name) => {
+                if button == 0 {
+                    crate::config::save_profile(manager, &name);
+                }
+                true
+            }
+            HitKind::ProfileDelete(name) => {
+                if button == 0 {
+                    self.confirm = Some(ConfirmKind::DeleteProfile(name));
+                }
+                true
+            }
+            HitKind::ResetAll => {
+                if button == 0 {
+                    self.confirm = Some(ConfirmKind::ResetAll);
+                    self.open_dropdown = None;
+                    self.listening_bind = None;
+                }
+                true
+            }
+            HitKind::ConfirmAccept
+            | HitKind::ConfirmCancel
+            | HitKind::ConfirmScrim
+            | HitKind::ConfirmDismiss => true,
             HitKind::SettingKeybind { mod_idx, set_idx } => {
                 if button == 0 {
                     self.listening_bind = Some(BindTarget::Setting { mod_idx, set_idx });
@@ -2404,6 +3238,16 @@ impl ClickGuiState {
                 manager.dirty = true;
                 true
             }
+            DragTarget::Widget { id, offset, size } => {
+                let origin = hud::clamp_widget_origin(
+                    [mouse[0] - offset[0], mouse[1] - offset[1]],
+                    self.screen_size,
+                    size,
+                );
+                manager.hud_positions.insert(id.to_owned(), origin);
+                manager.dirty = true;
+                true
+            }
         }
     }
 
@@ -2420,6 +3264,9 @@ impl ClickGuiState {
     ) -> bool {
         if scroll_y.abs() < 1e-4 {
             return false;
+        }
+        if self.confirm.is_some() {
+            return true;
         }
 
         // Scroll inside open Dropdown popover first
@@ -2439,6 +3286,14 @@ impl ClickGuiState {
             if rect_contains(rect, mouse) && max_scroll > 0.5 {
                 p.scroll = (p.scroll - scroll_y as f32 * 18.0).clamp(0.0, max_scroll);
             }
+            return true;
+        }
+
+        if let Some((rect, max_scroll)) = self.profile_list_rect
+            && rect_contains(rect, mouse)
+            && max_scroll > 0.5
+        {
+            self.profile_scroll = (self.profile_scroll - scroll_y as f32 * 18.0).clamp(0.0, max_scroll);
             return true;
         }
 
@@ -2484,6 +3339,15 @@ impl ClickGuiState {
     }
 
     pub fn key_pressed(&mut self, key: &str, manager: &mut ModuleManager) -> bool {
+        if self.confirm.is_some() {
+            if key == "key.keyboard.escape" {
+                self.confirm = None;
+            } else if key == "key.keyboard.enter" {
+                self.apply_confirm(manager);
+            }
+            return true;
+        }
+
         // Keybind capture has highest priority
         if let Some(target) = self.listening_bind.take() {
             let cleared = matches!(
@@ -2534,6 +3398,19 @@ impl ClickGuiState {
             return true;
         }
 
+        if self.profile_name_focused {
+            match key {
+                "key.keyboard.escape" => self.profile_name_focused = false,
+                "key.keyboard.enter" => self.try_create_profile(manager),
+                "key.keyboard.backspace" => {
+                    self.profile_name.pop();
+                    self.profile_error = None;
+                }
+                _ => {}
+            }
+            return true;
+        }
+
         if self.search_focused {
             match key {
                 "key.keyboard.escape" | "key.keyboard.enter" => {
@@ -2552,7 +3429,7 @@ impl ClickGuiState {
     }
 
     pub fn char_typed(&mut self, c: char) -> bool {
-        if self.listening_bind.is_some() {
+        if self.confirm.is_some() || self.listening_bind.is_some() {
             return true;
         }
         if let Some(p) = &mut self.entity_picker {
@@ -2563,6 +3440,17 @@ impl ClickGuiState {
                 return true;
             }
             return false;
+        }
+        if self.profile_name_focused {
+            if c.is_ascii_alphanumeric() || matches!(c, ' ' | '-' | '_') {
+                if self.profile_name.chars().count() < 24 {
+                    self.profile_name.push(c);
+                    self.profile_error = None;
+                }
+            } else if !c.is_control() {
+                self.profile_error = Some("Use letters, numbers, spaces, - or _.".to_owned());
+            }
+            return true;
         }
         if self.search_focused && !c.is_control() && self.search.len() < 32 {
             self.search.push(c);
@@ -2581,7 +3469,7 @@ impl ClickGuiState {
 
 fn module_drawer_height(m: &crate::module::Module, include_module_bind: bool) -> f32 {
     let mut h = if include_module_bind && m.id != ModuleId::ClickGui {
-        SETTING_H
+        SETTING_H * MODULE_META_ROWS
     } else {
         0.0
     };
@@ -2716,5 +3604,145 @@ mod tests {
         gui.step_animations(1190, &mgr);
         assert!((gui.drawer_ease(1) - 1.0).abs() < 1e-4);
         assert!(gui.drawer_ease(0) < 1e-4);
+    }
+
+    #[test]
+    fn profile_create_and_confirmed_reset() {
+        let mut mgr = ModuleManager::new();
+        mgr.toggle(ModuleId::AimAssist);
+        mgr.modules[0].keybind = Some("key.keyboard.r".to_owned());
+
+        let mut gui = ClickGuiState {
+            profile_name_focused: true,
+            ..Default::default()
+        };
+        assert!(gui.char_typed('p'));
+        assert!(gui.char_typed('v'));
+        assert!(gui.key_pressed("key.keyboard.enter", &mut mgr));
+        assert_eq!(mgr.profiles.len(), 1);
+        assert_eq!(mgr.active_profile, "pv");
+        assert!(mgr.profiles[0].body.contains("key.keyboard.r"));
+
+        gui.hits.push(HitRegion {
+            rect: [0.0, 0.0, 40.0, 16.0],
+            kind: HitKind::ResetAll,
+            tooltip: None,
+        });
+        assert!(gui.mouse_pressed([4.0, 4.0], 0, &mut mgr));
+        assert_eq!(gui.confirm, Some(ConfirmKind::ResetAll));
+        assert!(mgr.is_enabled(ModuleId::AimAssist));
+
+        gui.hits.clear();
+        gui.hits.push(HitRegion {
+            rect: [0.0, 0.0, 40.0, 16.0],
+            kind: HitKind::ConfirmCancel,
+            tooltip: None,
+        });
+        assert!(gui.mouse_pressed([4.0, 4.0], 0, &mut mgr));
+        assert!(gui.confirm.is_none());
+        assert!(mgr.is_enabled(ModuleId::AimAssist));
+
+        gui.confirm = Some(ConfirmKind::ResetAll);
+        gui.hits.clear();
+        gui.hits.push(HitRegion {
+            rect: [0.0, 0.0, 40.0, 16.0],
+            kind: HitKind::ConfirmAccept,
+            tooltip: None,
+        });
+        assert!(gui.mouse_pressed([4.0, 4.0], 0, &mut mgr));
+        assert!(gui.confirm.is_none());
+        assert!(!mgr.is_enabled(ModuleId::AimAssist));
+        assert!(mgr.modules[0].keybind.is_none());
+        assert_eq!(mgr.profiles.len(), 1);
+        assert!(mgr.active_profile.is_empty());
+    }
+
+    fn click(gui: &mut ClickGuiState, mgr: &mut ModuleManager, kind: HitKind, button: i32) -> bool {
+        gui.hits.clear();
+        gui.hits.push(HitRegion {
+            rect: [0.0, 0.0, 100.0, 20.0],
+            kind,
+            tooltip: None,
+        });
+        gui.mouse_pressed([5.0, 5.0], button, mgr)
+    }
+
+    #[test]
+    fn drawer_rows_change_bind_mode_favorite_and_reset() {
+        let mut mgr = ModuleManager::new();
+        let mut gui = ClickGuiState::default();
+        let idx = mgr.index_of(ModuleId::Sprint);
+
+        assert_eq!(mgr.bind_mode(ModuleId::Sprint), BindMode::Toggle);
+        assert!(click(&mut gui, &mut mgr, HitKind::ModuleBindMode(idx), 0));
+        assert_eq!(mgr.bind_mode(ModuleId::Sprint), BindMode::Hold);
+        assert!(click(&mut gui, &mut mgr, HitKind::ModuleBindMode(idx), 0));
+        assert_eq!(mgr.bind_mode(ModuleId::Sprint), BindMode::Toggle);
+
+        assert!(click(&mut gui, &mut mgr, HitKind::ModuleFavorite(idx), 0));
+        assert!(mgr.is_favorite(ModuleId::Sprint));
+        // Right-clicking a row must not flip it.
+        assert!(click(&mut gui, &mut mgr, HitKind::ModuleFavorite(idx), 1));
+        assert!(mgr.is_favorite(ModuleId::Sprint));
+
+        let radar = mgr.index_of(ModuleId::Radar);
+        mgr.get_mut(ModuleId::Radar)
+            .setting_mut("range")
+            .expect("radar has a range")
+            .deserialize_value("20");
+        let before = mgr.get(ModuleId::Radar).float("range", 0.0);
+        assert!(click(&mut gui, &mut mgr, HitKind::ModuleReset(radar), 0));
+        assert!(mgr.get(ModuleId::Radar).float("range", 0.0) > before);
+    }
+
+    #[test]
+    fn module_drawers_reserve_room_for_the_meta_rows() {
+        let mgr = ModuleManager::new();
+        let sprint = mgr.get(ModuleId::Sprint);
+        let with_meta = module_drawer_height(sprint, true);
+        let without = module_drawer_height(sprint, false);
+        assert!((with_meta - without - SETTING_H * MODULE_META_ROWS).abs() < 1e-4);
+        // The client settings card never shows module rows.
+        let gui_mod = mgr.get(ModuleId::ClickGui);
+        assert!((module_drawer_height(gui_mod, true) - module_drawer_height(gui_mod, false)).abs() < 1e-4);
+    }
+
+    #[test]
+    fn dragging_a_hud_widget_stores_a_clamped_position() {
+        let mut mgr = ModuleManager::new();
+        let mut gui = ClickGuiState {
+            screen_size: [320.0, 180.0],
+            ..Default::default()
+        };
+        let rect = [10.0, 40.0, 60.0, 30.0];
+        assert!(click(&mut gui, &mut mgr, HitKind::HudWidget { id: "radar", rect }, 0));
+        assert!(mgr.hud_positions.is_empty(), "pressing alone does not move it");
+
+        assert!(gui.mouse_dragged([105.0, 85.0], &mut mgr));
+        // The grab point (5, 5) sat at offset (-5, -35) from the widget's corner.
+        assert_eq!(mgr.hud_positions.get("radar"), Some(&[110.0, 120.0]));
+
+        // Dragging past the screen edge stays on screen.
+        assert!(gui.mouse_dragged([9999.0, 9999.0], &mut mgr));
+        let p = mgr.hud_positions["radar"];
+        assert!(p[0] <= 320.0 - 60.0 && p[1] <= 180.0 - 30.0);
+        assert!(gui.mouse_released());
+
+        assert!(click(&mut gui, &mut mgr, HitKind::HudWidget { id: "radar", rect }, 1));
+        assert!(!mgr.hud_positions.contains_key("radar"), "right click restores the default");
+    }
+
+    #[test]
+    fn config_buttons_queue_clipboard_work_for_the_host() {
+        let mut mgr = ModuleManager::new();
+        let mut gui = ClickGuiState::default();
+        assert!(gui.take_clipboard_action().is_none());
+        assert!(click(&mut gui, &mut mgr, HitKind::ConfigExport, 0));
+        assert_eq!(gui.take_clipboard_action(), Some(ClipboardAction::Export));
+        assert!(gui.take_clipboard_action().is_none());
+        assert!(click(&mut gui, &mut mgr, HitKind::ConfigImport, 0));
+        assert_eq!(gui.take_clipboard_action(), Some(ClipboardAction::Import));
+        assert!(click(&mut gui, &mut mgr, HitKind::ConfigImport, 1));
+        assert!(gui.take_clipboard_action().is_none(), "only the left button acts");
     }
 }

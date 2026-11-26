@@ -595,3 +595,85 @@ pub fn mouse_button_key(button: i32) -> Option<&'static str> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapping_clamps_and_rounds_to_the_step() {
+        assert_eq!(snap_float(7.3, 0.0, 10.0, 0.5), 7.5);
+        assert_eq!(snap_float(-4.0, 0.0, 10.0, 0.5), 0.0);
+        assert_eq!(snap_float(99.0, 0.0, 10.0, 0.5), 10.0);
+        // A zero or non-finite step must not divide by zero.
+        assert_eq!(snap_float(3.3, 0.0, 10.0, 0.0), 3.3);
+        assert_eq!(snap_float(3.3, 0.0, 10.0, f64::NAN), 3.3);
+        assert_eq!(snap_int(14, 0, 100, 5), 15);
+        assert_eq!(snap_int(-3, 0, 100, 5), 0);
+        assert_eq!(snap_int(1000, 0, 100, 5), 100);
+        assert_eq!(snap_int(7, 0, 100, 1), 7);
+    }
+
+    #[test]
+    fn float_settings_round_trip_and_clamp_hostile_input() {
+        let mut s = Setting::float("r", "Range", "", 1.0, 6.0, 0.1, 3.0);
+        s.deserialize_value("4.5");
+        assert_eq!(s.as_float(), Some(4.5));
+        assert_eq!(s.serialize_value().parse::<f64>().ok(), Some(4.5));
+
+        s.deserialize_value("1e99");
+        assert_eq!(s.as_float(), Some(6.0));
+        s.deserialize_value("-50");
+        assert_eq!(s.as_float(), Some(1.0));
+        s.deserialize_value("4.5");
+        s.deserialize_value("not a number");
+        assert_eq!(s.as_float(), Some(4.5), "garbage leaves the value alone");
+        s.deserialize_value("NaN");
+        assert!(s.as_float().is_some_and(f64::is_finite));
+    }
+
+    #[test]
+    fn reset_reports_whether_anything_changed() {
+        let mut s = Setting::int("n", "Count", "", 0, 10, 1, 4);
+        assert!(!s.reset());
+        s.deserialize_value("9");
+        assert_eq!(s.as_int(), Some(9));
+        assert!(s.reset());
+        assert_eq!(s.as_int(), Some(4));
+    }
+
+    #[test]
+    fn slider_fraction_matches_value_and_inverts() {
+        let mut s = Setting::float("r", "Range", "", 0.0, 10.0, 0.5, 5.0);
+        assert!((s.slider_fraction().unwrap_or(-1.0) - 0.5).abs() < 1e-6);
+        assert!(s.set_slider_fraction(1.0));
+        assert_eq!(s.as_float(), Some(10.0));
+        assert!(!s.set_slider_fraction(1.0), "no change reports false");
+        assert!(s.set_slider_fraction(-3.0));
+        assert_eq!(s.as_float(), Some(0.0));
+    }
+
+    #[test]
+    fn mode_settings_ignore_unknown_options() {
+        let mut s = Setting::mode("m", "Mode", "", &["A", "B", "C"], 1);
+        assert_eq!(s.as_mode(), Some(1));
+        s.deserialize_value("C");
+        assert_eq!(s.as_mode(), Some(2));
+        s.deserialize_value("nonsense");
+        assert_eq!(s.as_mode(), Some(2));
+        // An out-of-range default is pulled into range.
+        let big = Setting::mode("m", "Mode", "", &["A", "B"], 99);
+        assert_eq!(big.as_mode(), Some(1));
+    }
+
+    #[test]
+    fn key_names_are_short_and_mouse_buttons_map() {
+        assert_eq!(format_key_name(None), "NONE");
+        assert_eq!(format_key_name(Some("key.mouse.left")), "LMB");
+        assert_eq!(format_key_name(Some("key.keyboard.right.shift")), "RSHIFT");
+        assert_eq!(format_key_name(Some("key.keyboard.f6")), "F6");
+        assert_eq!(mouse_button_key(0), Some("key.mouse.left"));
+        assert_eq!(mouse_button_key(99), None);
+        assert_eq!(mouse_button_key(-1), None);
+    }
+}
