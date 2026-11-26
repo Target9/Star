@@ -5,6 +5,7 @@ use mod_api::{ClientHost, DrawContext};
 
 use crate::font::FontConfig;
 use crate::module::{ModuleId, ModuleManager};
+use crate::modules::aim_assist;
 use crate::modules::lock_visuals::{self, LockBoard};
 use crate::modules::trackers::Trackers;
 use crate::modules::{extras, visuals};
@@ -67,6 +68,9 @@ pub fn render(
     } else {
         toasts.clear();
     }
+
+    // Aim Assist's own FOV ring (not Lock Visuals — that stays module-agnostic).
+    aim_assist::render_fov_ring(host, draw, manager.get(ModuleId::AimAssist), theme.accent);
 
     // Lock Visuals is a shared component: it draws for whichever module holds a lock.
     lock_visuals::render_screen(host, draw, manager, lock, &theme, font);

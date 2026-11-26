@@ -333,20 +333,29 @@ pub fn deserialize(text: &str, manager: &mut ModuleManager) -> bool {
         if let Some(rest) = key.strip_prefix("set.")
             && let Some((mut mod_key, setting_id)) = rest.split_once('.')
         {
-            // Aim Assist's visuals became their own module (first "Aim Visuals", now the
-            // shared "Lock Visuals"); carry old values over.
+            // Target-HUD settings moved Aim Assist → Aim Visuals → Lock Visuals.
+            // FOV ring / range circle stay on Aim Assist (and may have briefly lived on
+            // the interim visuals modules).
             let mut setting_id = setting_id;
-            if mod_key == "aim_visuals"
+            let is_indicator = matches!(
+                setting_id,
+                "show_fov_circle" | "show_fov_ring" | "show_range_circle" | "ring_opacity" | "ring_width"
+            );
+            if is_indicator
+                && matches!(mod_key, "aim_visuals" | "lock_visuals" | "aim_assist")
+            {
+                mod_key = "aim_assist";
+                if setting_id == "show_fov_circle" {
+                    setting_id = "show_fov_ring";
+                }
+            } else if mod_key == "aim_visuals"
                 || (mod_key == "aim_assist"
-                    && crate::modules::aim_assist::MOVED_VISUAL_SETTINGS.contains(&setting_id))
+                    && crate::modules::aim_assist::MOVED_TO_LOCK_VISUALS.contains(&setting_id))
             {
                 if mod_key == "aim_assist" && setting_id.starts_with("show_") && val == "true" {
                     legacy_visuals_on = true;
                 }
                 mod_key = "lock_visuals";
-                if setting_id == "show_fov_circle" {
-                    setting_id = "show_fov_ring";
-                }
             }
             if let Some(module) = manager.by_key_mut(mod_key)
                 && let Some(setting) = module.setting_mut(setting_id)
@@ -676,25 +685,26 @@ mod tests {
     fn old_aim_assist_visual_settings_move_to_lock_visuals() {
         let old = format!(
             "{HEADER}\n# format=3\nmod.aim_assist.enabled=true\n\
-             set.aim_assist.show_target_hud=false\nset.aim_assist.hud_ping=false\n\
-             set.aim_assist.show_range_circle=true\nset.aim_assist.range=5.0\n{END_MARKER}\n"
+             set.aim_assist.show_target_hud=true\nset.aim_assist.hud_ping=false\n\
+             set.aim_assist.show_range_circle=false\nset.aim_assist.range=5.0\n{END_MARKER}\n"
         );
         let mut mgr = ModuleManager::new();
         assert!(deserialize(&old, &mut mgr), "migration asks for a re-save");
         let visuals = mgr.get(ModuleId::LockVisuals);
-        assert!(visuals.enabled, "visuals stay on for users who had them on");
-        assert!(!visuals.bool("show_target_hud", true));
+        assert!(visuals.enabled, "target HUD stays on for users who had it on");
+        assert!(visuals.bool("show_target_hud", false));
         assert!(!visuals.bool("hud_ping", true));
-        assert!(visuals.bool("show_range_circle", false));
-        assert!((mgr.get(ModuleId::AimAssist).float("range", 0.0) - 5.0).abs() < 1e-6);
+        let aim = mgr.get(ModuleId::AimAssist);
+        assert!(!aim.bool("show_range_circle", true), "indicators stay on Aim Assist");
+        assert!((aim.float("range", 0.0) - 5.0).abs() < 1e-6);
 
         // Saved again, the file carries the new module and migrates nothing further.
         let mut again = ModuleManager::new();
         assert!(!deserialize(&serialize(&mgr), &mut again));
         assert!(again.is_enabled(ModuleId::LockVisuals));
-        assert!(!again.get(ModuleId::LockVisuals).bool("show_target_hud", true));
+        assert!(!again.get(ModuleId::LockVisuals).bool("hud_ping", true));
 
-        // Nothing was on before: the new module stays off.
+        // Target HUD was off before: Lock Visuals stays off.
         let quiet = format!(
             "{HEADER}\n# format=3\nmod.aim_assist.enabled=true\nset.aim_assist.show_target_hud=false\n{END_MARKER}\n"
         );
@@ -704,17 +714,19 @@ mod tests {
     }
 
     #[test]
-    fn interim_aim_visuals_keys_load_into_lock_visuals() {
+    fn interim_aim_visuals_keys_split_into_aim_assist_and_lock_visuals() {
         let old = format!(
             "{HEADER}\n# format=3\nmod.aim_visuals.enabled=true\n\
              set.aim_visuals.show_fov_circle=false\nset.aim_visuals.hud_name=false\n{END_MARKER}\n"
         );
         let mut mgr = ModuleManager::new();
         deserialize(&old, &mut mgr);
-        let lock = mgr.get(ModuleId::LockVisuals);
-        assert!(lock.enabled);
-        assert!(!lock.bool("show_fov_ring", true), "renamed setting carries over");
-        assert!(!lock.bool("hud_name", true));
+        assert!(mgr.get(ModuleId::LockVisuals).enabled);
+        assert!(!mgr.get(ModuleId::LockVisuals).bool("hud_name", true));
+        assert!(
+            !mgr.get(ModuleId::AimAssist).bool("show_fov_ring", true),
+            "FOV ring returns to Aim Assist"
+        );
     }
 
     #[test]

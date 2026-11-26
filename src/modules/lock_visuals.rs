@@ -7,9 +7,9 @@
 //! 2. While the module is locked onto something, build a [`LockTarget`] each tick or frame
 //!    and call [`LockBoard::publish`] with it. Publish `None` when the lock is gone.
 //!
-//! Lock Visuals then draws the target HUD, reticle, 3D box, link line, FOV ring and range
-//! circle for whichever source is locked, with its own configuration. Sources never draw
-//! any of this themselves.
+//! Lock Visuals then draws the target HUD, reticle, 3D box and link line for whichever
+//! source is locked, with its own configuration. Module-specific indicators (like Aim
+//! Assist's FOV ring and range circle) stay on that module.
 //!
 //! The screen part is [`render_screen`] (called from the HUD hook) and the world part is
 //! [`render_world`] (called from the custom geometry hook).
@@ -87,10 +87,6 @@ pub struct LockTarget {
     pub ping_ms: Option<i32>,
     /// World point the source is aiming at.
     pub aim_point: [f64; 3],
-    /// The source's field-of-view cone in degrees, drawn as the FOV ring.
-    pub fov_deg: Option<f32>,
-    /// The source's reach in blocks, drawn as the range circle.
-    pub range: Option<f64>,
 }
 
 impl LockTarget {
@@ -237,13 +233,6 @@ pub fn build_module() -> Module {
     }
 
     settings.extend([
-        Setting::bool(
-            "only_when_locked",
-            "Only When Locked",
-            "Show the FOV ring and range circle only while something is locked. Off keeps them on screen as a preview using Aim Assist's values.",
-            true,
-        )
-        .group("Behavior"),
         Setting::float(
             "linger",
             "Fade Out",
@@ -253,7 +242,8 @@ pub fn build_module() -> Module {
             50.0,
             300.0,
         )
-        .suffix("ms"),
+        .suffix("ms")
+        .group("Behavior"),
         Setting::bool(
             "lock_anim",
             "Lock-On Animation",
@@ -426,44 +416,11 @@ pub fn build_module() -> Module {
             1.4,
         )
         .suffix("px"),
-        // Indicators
-        Setting::bool(
-            "show_fov_ring",
-            "FOV Ring",
-            "Draw a ring around the crosshair sized to the source's FOV cone.",
-            true,
-        )
-        .group("Indicators"),
-        Setting::bool(
-            "show_range_circle",
-            "Range Circle",
-            "Draw a circle on the ground showing the source's range.",
-            true,
-        ),
-        Setting::float(
-            "ring_opacity",
-            "Opacity",
-            "Opacity of the FOV ring and range circle.",
-            0.1,
-            1.0,
-            0.05,
-            0.55,
-        ),
-        Setting::float(
-            "ring_width",
-            "Line Width",
-            "FOV ring and range circle thickness in pixels.",
-            0.5,
-            4.0,
-            0.1,
-            1.2,
-        )
-        .suffix("px"),
         // Color
         Setting::mode(
             "color_mode",
             "Color Mode",
-            "How reticle, box, link line and rings are colored: theme accent, by the target's health, by its distance, or a custom color.",
+            "How reticle, box and link line are colored: theme accent, by the target's health, by its distance, or a custom color.",
             &["Accent", "Health", "Distance", "Custom"],
             0,
         )
@@ -480,7 +437,7 @@ pub fn build_module() -> Module {
         id: ModuleId::LockVisuals,
         key: "lock_visuals",
         name: "Lock Visuals",
-        description: "Shows target info, reticle, box, link line and rings whenever a module like Aim Assist locks onto a target.",
+        description: "Shared lock-on display: target HUD, reticle, box and link line for any module that locks onto a target. Module-specific indicators stay on that module.",
         category: Category::Render,
         enabled: false,
         keybind: None,
@@ -513,8 +470,8 @@ pub fn lock_color(module: &Module, target: &LockTarget, accent: u32) -> u32 {
     match module.mode("color_mode", 0) {
         1 => health_fraction(target).map_or(accent, health_color),
         2 => {
-            let range = target.range.unwrap_or(6.0).max(1.0);
-            let frac = (target.distance / range).clamp(0.0, 1.0) as f32;
+            // Distance mode is relative to a typical short-range lock (~6 blocks).
+            let frac = (target.distance / 6.0).clamp(0.0, 1.0) as f32;
             health_color(1.0 - frac)
         }
         3 => module.color("custom_color", accent),
@@ -548,26 +505,6 @@ pub fn hud_origin(mode: usize, screen: [f32; 2], size: [f32; 2]) -> [f32; 2] {
     ]
 }
 
-/// Source FOV (degrees) and range (blocks) used for the rings, from the live lock when
-/// there is one and otherwise, when allowed, from Aim Assist's settings as a preview.
-fn ring_values(
-    module: &Module,
-    manager: &ModuleManager,
-    lock: Option<&LockView<'_>>,
-) -> (Option<f32>, Option<f64>) {
-    let from_lock = lock.map(|l| (l.target.fov_deg, l.target.range));
-    let (mut fov, mut range) = from_lock.unwrap_or((None, None));
-    if lock.is_none() && module.bool("only_when_locked", true) {
-        return (None, None);
-    }
-    if fov.is_none() || range.is_none() {
-        let aim = manager.get(ModuleId::AimAssist);
-        fov = fov.or(Some(aim.int("fov", 90) as f32));
-        range = range.or(Some(aim.float("range", 4.5)));
-    }
-    (fov, range)
-}
-
 fn current_lock<'a>(
     module: &Module,
     board: &'a LockBoard,
@@ -581,7 +518,7 @@ fn current_lock<'a>(
 // Screen rendering
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Draws the screen-space parts: FOV ring, reticle and Target HUD.
+/// Draws the screen-space parts: reticle and Target HUD.
 pub fn render_screen(
     host: &dyn ClientHost,
     draw: &mut dyn DrawContext,
@@ -596,33 +533,7 @@ pub fn render_screen(
     }
     let now_ms = host.millis();
     let size = draw.size();
-    let lock = current_lock(module, board, now_ms);
-    let fade = lock.as_ref().map_or(1.0, |l| l.fade);
-
-    if module.bool("show_fov_ring", true)
-        && let (Some(fov), _) = ring_values(module, manager, lock.as_ref())
-        && fov < 360.0
-    {
-        let camera_fov = host
-            .camera()
-            .map(|c| c.fov_degrees)
-            .filter(|f| f.is_finite() && *f > 1.0)
-            .unwrap_or_else(|| host.graphics_options().fov.max(30.0));
-        let color = lock
-            .as_ref()
-            .map_or(theme.accent, |l| lock_color(module, l.target, theme.accent));
-        let alpha = (module.float("ring_opacity", 0.55).clamp(0.0, 1.0) * 255.0).round() as u32;
-        draw_fov_ring(
-            draw,
-            size,
-            fov,
-            camera_fov,
-            module.float("ring_width", 1.2) as f32,
-            fade_color(with_alpha(color, alpha.min(255) as u8), fade),
-        );
-    }
-
-    let Some(lock) = lock else {
+    let Some(lock) = current_lock(module, board, now_ms) else {
         return;
     };
     let color = lock_color(module, lock.target, theme.accent);
@@ -833,34 +744,11 @@ fn draw_reticle(
     }
 }
 
-/// Screen-space ring sized so the source's angular cone matches the live camera FOV.
-fn draw_fov_ring(
-    draw: &mut dyn DrawContext,
-    size: [f32; 2],
-    cone_fov_deg: f32,
-    camera_fov_deg: f32,
-    thickness: f32,
-    color: u32,
-) {
-    let cone_half = (cone_fov_deg * 0.5).clamp(0.5, 89.0).to_radians();
-    let cam_half = (camera_fov_deg * 0.5).clamp(1.0, 89.0).to_radians();
-    let radius = ((cone_half.tan() / cam_half.tan()) * (size[1] * 0.5))
-        .clamp(8.0, size[1].min(size[0]) * 0.55);
-    draw_ring(
-        draw,
-        [size[0] * 0.5, size[1] * 0.5],
-        radius,
-        thickness.clamp(0.3, 6.0),
-        48,
-        color,
-    );
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // World rendering
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Draws the world-space parts: range circle, target box and link line.
+/// Draws the world-space parts: target box and link line.
 pub fn render_world(
     host: &dyn ClientHost,
     view: &WorldRenderView,
@@ -877,87 +765,52 @@ pub fn render_world(
     let Some(player) = host.camera_entity() else {
         return;
     };
-    let lock = current_lock(module, board, host.millis());
-    let fade = lock.as_ref().map_or(1.0, |l| l.fade);
+    let Some(lock) = current_lock(module, board, host.millis()).filter(|l| l.live) else {
+        return;
+    };
 
     let usage = draw.usage();
     let max_lines = usage.line_capacity.saturating_sub(usage.lines) as usize;
     let max_quads = usage.quad_capacity.saturating_sub(usage.quads) as usize;
     let mut lines: Vec<WorldLine> = Vec::new();
     let mut quads: Vec<WorldQuad> = Vec::new();
+    let color = lock_color(module, lock.target, accent);
 
-    let ring_alpha = (module.float("ring_opacity", 0.55).clamp(0.0, 1.0) * 255.0).round() as u32;
-    let ring_width = module.float("ring_width", 1.2).clamp(0.3, 6.0) as f32;
-
-    // Range circle on the ground.
-    if module.bool("show_range_circle", true)
-        && let (_, Some(range)) = ring_values(module, manager, lock.as_ref())
-        && let Some(feet) = player.position(host)
+    if module.bool("show_box", false)
+        && let Some(entity) = lock.target.entity
+        && let Some(raw) = entity.bounding_box(host)
     {
-        let segments = 48usize;
-        if max_lines >= segments {
-            let range = range.clamp(0.5, 32.0);
-            let color = lock
-                .as_ref()
-                .map_or(accent, |l| lock_color(module, l.target, accent));
-            let color = fade_color(with_alpha(color, ring_alpha.min(255) as u8), fade);
-            let y = feet[1] + 0.05;
-            for i in 0..segments {
-                let a0 = (i as f64 / segments as f64) * std::f64::consts::TAU;
-                let a1 = ((i + 1) as f64 / segments as f64) * std::f64::consts::TAU;
-                let (s0, c0) = a0.sin_cos();
-                let (s1, c1) = a1.sin_cos();
-                lines.push(WorldLine::new(
-                    [feet[0] + c0 * range, y, feet[2] + s0 * range],
-                    [feet[0] + c1 * range, y, feet[2] + s1 * range],
-                    color,
-                    ring_width,
-                    WorldDepth::Tested,
-                ));
-            }
+        let [lo, hi] = interp.interpolate_box(entity.id(), raw, view.partial_tick);
+        let depth = if module.bool("box_through_walls", true) {
+            WorldDepth::ThroughWalls
+        } else {
+            WorldDepth::Tested
+        };
+        let width = module.float("box_width", 1.8).clamp(0.3, 8.0) as f32;
+        if lines.len() + 12 <= max_lines {
+            push_box_lines(&mut lines, lo, hi, color, width, depth);
+        }
+        if module.mode("box_style", 0) == 1 && quads.len() + 6 <= max_quads {
+            let alpha = (module.float("box_fill", 0.16).clamp(0.0, 1.0) * 255.0).round() as u32;
+            push_box_quads(&mut quads, lo, hi, with_alpha(color, alpha.min(255) as u8), depth);
         }
     }
 
-    // Target box and link line only follow a lock that is still held.
-    if let Some(lock) = lock.as_ref().filter(|l| l.live) {
-        let color = lock_color(module, lock.target, accent);
-
-        if module.bool("show_box", false)
-            && let Some(entity) = lock.target.entity
-            && let Some(raw) = entity.bounding_box(host)
-        {
-            let [lo, hi] = interp.interpolate_box(entity.id(), raw, view.partial_tick);
-            let depth = if module.bool("box_through_walls", true) {
-                WorldDepth::ThroughWalls
-            } else {
-                WorldDepth::Tested
-            };
-            let width = module.float("box_width", 1.8).clamp(0.3, 8.0) as f32;
-            if lines.len() + 12 <= max_lines {
-                push_box_lines(&mut lines, lo, hi, color, width, depth);
-            }
-            if module.mode("box_style", 0) == 1 && quads.len() + 6 <= max_quads {
-                let alpha = (module.float("box_fill", 0.16).clamp(0.0, 1.0) * 255.0).round() as u32;
-                push_box_quads(&mut quads, lo, hi, with_alpha(color, alpha.min(255) as u8), depth);
-            }
-        }
-
-        if module.bool("show_link", false) && lines.len() < max_lines {
-            let cam = view.camera;
-            let dir = player.view_vector(host).unwrap_or_else(|| {
-                let [yaw, pitch] = player.rotation(host).unwrap_or([0.0, 0.0]);
-                look_dir(yaw, pitch)
-            });
-            let origin = [cam[0] + dir[0] * 0.35, cam[1] + dir[1] * 0.35, cam[2] + dir[2] * 0.35];
-            if dist3(origin, lock.target.aim_point) > 0.2 {
-                lines.push(WorldLine::new(
-                    origin,
-                    lock.target.aim_point,
-                    with_alpha(color, 0xD8),
-                    module.float("link_width", 1.4).clamp(0.3, 6.0) as f32,
-                    WorldDepth::ThroughWalls,
-                ));
-            }
+    if module.bool("show_link", false) && lines.len() < max_lines {
+        let cam = view.camera;
+        let dir = player.view_vector(host).unwrap_or_else(|| {
+            let [yaw, pitch] = player.rotation(host).unwrap_or([0.0, 0.0]);
+            look_dir(yaw, pitch)
+        });
+        let origin = [cam[0] + dir[0] * 0.35, cam[1] + dir[1] * 0.35, cam[2] + dir[2] * 0.35];
+        if dist3(origin, lock.target.aim_point) > 0.2 {
+            lines.push(WorldLine::new(
+                origin,
+                lock.target.aim_point,
+                with_alpha(color, 0xD8),
+                module.float("link_width", 1.4).clamp(0.3, 6.0) as f32,
+                WorldDepth::ThroughWalls,
+            ));
         }
     }
 
@@ -989,8 +842,6 @@ mod tests {
             max_health: Some(20.0),
             ping_ms: None,
             aim_point: [0.0, 1.0, 0.0],
-            fov_deg: Some(90.0),
-            range: Some(4.5),
         }
     }
 
@@ -1010,6 +861,10 @@ mod tests {
             assert!(m.bool(source.setting, false), "sources default to on");
         }
         assert_eq!(m.settings.first().and_then(|s| s.group), Some("Sources"));
+        assert!(
+            m.setting("show_fov_ring").is_none() && m.setting("show_range_circle").is_none(),
+            "FOV/range indicators belong on the locking module, not Lock Visuals"
+        );
     }
 
     #[test]
@@ -1133,19 +988,4 @@ mod tests {
         let _ = hud_origin(3, [50.0, 50.0], [200.0, 200.0]);
     }
 
-    #[test]
-    fn rings_follow_the_lock_and_preview_only_when_allowed() {
-        let mgr = ModuleManager::new();
-        let mut m = build_module();
-        let t = target(ModuleId::AimAssist, "A");
-        let mut board = LockBoard::default();
-        board.publish(ModuleId::AimAssist, Some(t), 0);
-        let view = board.active(0, 0, any);
-        assert_eq!(ring_values(&m, &mgr, view.as_ref()), (Some(90.0), Some(4.5)));
-
-        assert_eq!(ring_values(&m, &mgr, None), (None, None), "hidden when not locked");
-        m.setting_mut("only_when_locked").expect("setting").deserialize_value("false");
-        let (fov, range) = ring_values(&m, &mgr, None);
-        assert!(fov.is_some() && range.is_some(), "preview uses Aim Assist's values");
-    }
 }

@@ -5,12 +5,16 @@
 //! activation conditions, line-of-sight filtering, smoothing, deadzone, and
 //! movement prediction.
 
-use mod_api::{ClientHost, ClipBlock, ClipFluid, EntityRef, Hand};
+use mod_api::{
+    ClientHost, ClipBlock, ClipFluid, DrawContext, EntityRef, Hand, WorldDepth, WorldDrawContext,
+    WorldLine,
+};
 
 use crate::entity_filter::{EntityFilter, pretty_entity_id};
 use crate::module::{Category, Module, ModuleId};
 use crate::modules::lock_visuals::LockTarget;
 use crate::settings::Setting;
+use crate::theme::with_alpha;
 /// Constructs the `Aim Assist` module definition with all customizable settings.
 pub fn build_module() -> Module {
     Module {
@@ -141,21 +145,32 @@ pub fn build_module() -> Module {
                 0.0,
             )
             .suffix("t"),
+            Setting::bool(
+                "show_fov_ring",
+                "FOV Ring",
+                "Draw a ring around the crosshair sized to Aim Assist's FOV vs your camera FOV.",
+                true,
+            )
+            .group("Indicators"),
+            Setting::bool(
+                "show_range_circle",
+                "Range Circle",
+                "Draw a circle on the ground showing Aim Assist's range.",
+                true,
+            ),
         ],
     }
 }
 
-/// Settings that used to live on Aim Assist and now belong to `Lock Visuals`.
-/// Old configs are migrated by `config::deserialize`.
-pub const MOVED_VISUAL_SETTINGS: [&str; 8] = [
+/// Target-HUD settings that used to live on Aim Assist and now belong to `Lock Visuals`.
+/// FOV ring / range circle stay on Aim Assist. Old configs are migrated by `config::deserialize`.
+pub const MOVED_TO_LOCK_VISUALS: [&str; 6] = [
     "show_target_hud",
     "hud_name",
     "hud_health",
     "hud_distance",
     "hud_angle",
     "hud_ping",
-    "show_fov_circle",
-    "show_range_circle",
 ];
 
 /// Runs one step of Aim Assist. `tick_scale` is `1.0` for a 50ms client tick,
@@ -253,9 +268,99 @@ pub fn step(
         max_health,
         ping_ms,
         aim_point: point,
-        fov_deg: Some(fov),
-        range: Some(range),
     })
+}
+
+/// Screen-space FOV ring sized so Aim Assist's angular cone matches the live camera FOV.
+pub fn render_fov_ring(
+    host: &dyn ClientHost,
+    draw: &mut dyn DrawContext,
+    module: &Module,
+    accent: u32,
+) {
+    if !module.enabled || !module.bool("show_fov_ring", true) || !host.playing() {
+        return;
+    }
+    let aim_fov = module.int("fov", 90) as f32;
+    if aim_fov >= 360.0 {
+        return;
+    }
+    let size = draw.size();
+    let camera_fov = host
+        .camera()
+        .map(|c| c.fov_degrees)
+        .filter(|f| f.is_finite() && *f > 1.0)
+        .unwrap_or_else(|| host.graphics_options().fov.max(30.0));
+    let cx = size[0] * 0.5;
+    let cy = size[1] * 0.5;
+    let aim_half = (aim_fov * 0.5).clamp(0.5, 89.0).to_radians();
+    let cam_half = (camera_fov * 0.5).clamp(1.0, 89.0).to_radians();
+    let radius = ((aim_half.tan() / cam_half.tan()) * (size[1] * 0.5))
+        .clamp(8.0, size[1].min(size[0]) * 0.55);
+    let color = with_alpha(accent, 0x88);
+    let thickness = 1.15_f32;
+    let segments = 48usize;
+    for i in 0..segments {
+        let a0 = (i as f32 / segments as f32) * std::f32::consts::TAU;
+        let a1 = ((i + 1) as f32 / segments as f32) * std::f32::consts::TAU;
+        let (s0, c0) = a0.sin_cos();
+        let (s1, c1) = a1.sin_cos();
+        let r_in = (radius - thickness * 0.5).max(1.0);
+        let r_out = radius + thickness * 0.5;
+        draw.quad(
+            [
+                [cx + c0 * r_in, cy + s0 * r_in],
+                [cx + c0 * r_out, cy + s0 * r_out],
+                [cx + c1 * r_out, cy + s1 * r_out],
+                [cx + c1 * r_in, cy + s1 * r_in],
+            ],
+            color,
+        );
+    }
+}
+
+/// Flat range circle on the ground under the local player, sized to Aim Assist's range.
+pub fn render_range_circle(
+    host: &dyn ClientHost,
+    draw: &mut dyn WorldDrawContext,
+    module: &Module,
+    accent: u32,
+) {
+    if !module.enabled || !module.bool("show_range_circle", true) || !host.playing() {
+        return;
+    }
+    let Some(player) = host.camera_entity() else {
+        return;
+    };
+    let Some(feet) = player.position(host) else {
+        return;
+    };
+    let range = module.float("range", 4.5).clamp(0.5, 32.0);
+    let y = feet[1] + 0.05;
+    let segments = 48usize;
+    let usage = draw.usage();
+    let budget = usage.line_capacity.saturating_sub(usage.lines) as usize;
+    if budget < segments {
+        return;
+    }
+
+    let mut lines = Vec::with_capacity(segments);
+    let color = with_alpha(accent, 0xB0);
+    let width = 1.6_f32;
+    for i in 0..segments {
+        let a0 = (i as f64 / segments as f64) * std::f64::consts::TAU;
+        let a1 = ((i + 1) as f64 / segments as f64) * std::f64::consts::TAU;
+        let (s0, c0) = a0.sin_cos();
+        let (s1, c1) = a1.sin_cos();
+        lines.push(WorldLine::new(
+            [feet[0] + c0 * range, y, feet[2] + s0 * range],
+            [feet[0] + c1 * range, y, feet[2] + s1 * range],
+            color,
+            width,
+            WorldDepth::ThroughWalls,
+        ));
+    }
+    let _ = draw.lines(&lines);
 }
 
 fn lookup_ping(host: &dyn ClientHost, name: &str) -> Option<i32> {
