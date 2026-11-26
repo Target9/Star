@@ -184,20 +184,31 @@ pub fn visuals_on(manager: &ModuleManager) -> bool {
     manager.get(ModuleId::VisPreset).enabled
 }
 
-/// Update trip onset / wave state and drain hit FX. Call once per tick while playing.
+/// Result of one Visuals tick. Host side-effects (`refresh_biome_colors`, particles,
+/// sounds) must run **without** holding `STATE` — those APIs can re-enter hooks that
+/// also lock it and would otherwise hard-deadlock the game.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TickOutcome {
+    pub refresh_biomes: bool,
+}
+
+/// Update trip onset / wave / punch state. Does **not** call into the host.
+///
+/// After dropping the client-state lock the caller should:
+/// 1. call [`emit_frame_fx`] (particles / audio), then
+/// 2. call `refresh_biome_colors` when [`TickOutcome::refresh_biomes`] is set.
 pub fn on_tick(
-    host: &mut dyn ClientHost,
+    now: u64,
     manager: &ModuleManager,
-    trackers: &mut Trackers,
     fx: &mut FxState,
-    theme: &Theme,
-) {
+) -> TickOutcome {
+    let mut out = TickOutcome::default();
     if !visuals_on(manager) {
         fx.trip_level = 0.0;
-        return;
+        fx.need_biome_refresh = false;
+        return out;
     }
 
-    let now = host.millis();
     let dose = manager.get(ModuleId::VisPreset).float("dose", 0.0) as f32;
     let onset_s = manager.get(ModuleId::VisTrip).float("onset", 8.0) as f32;
     if (dose - fx.last_dose).abs() > 0.01 {
@@ -217,7 +228,7 @@ pub fn on_tick(
     let ease = onset_t * onset_t * (3.0 - 2.0 * onset_t);
     fx.trip_level = dose * ease;
 
-    // Preset change → biome refresh flag.
+    // Preset change → biome refresh flag (only meaningful while tinting is on).
     let preset_idx = manager.get(ModuleId::VisPreset).mode("preset", 0);
     if fx.last_preset_idx != Some(preset_idx) {
         fx.last_preset_idx = Some(preset_idx);
@@ -229,9 +240,13 @@ pub fn on_tick(
     let want_tint = world.bool("tint_biomes", false)
         || (fx.trip_level > 0.05 && trip.bool("rainbow_biomes", true));
     let sig = biome_signature(manager, fx.trip_level);
-    if want_tint && (sig != fx.last_biome_sig || fx.need_biome_refresh) {
+    if !want_tint {
+        fx.need_biome_refresh = false;
+        fx.last_biome_sig = sig;
+    } else if sig != fx.last_biome_sig || fx.need_biome_refresh {
+        // Ask the caller to refresh after the STATE lock is dropped.
         if now.saturating_sub(fx.last_biome_refresh_ms) >= BIOME_REFRESH_MIN_MS {
-            host.refresh_biome_colors();
+            out.refresh_biomes = true;
             fx.last_biome_sig = sig;
             fx.last_biome_refresh_ms = now;
             fx.need_biome_refresh = false;
@@ -239,11 +254,6 @@ pub fn on_tick(
             fx.need_biome_refresh = true;
         }
     }
-
-    // Hit FX + ambient.
-    emit_hits(host, manager, trackers, fx, theme, now);
-    emit_ambient(host, manager, fx, theme, now);
-    maybe_audio_warp(host, manager, fx, now);
 
     // Decay punch.
     if now > fx.punch_until_ms {
@@ -254,6 +264,25 @@ pub fn on_tick(
             fx.punch_pitch = 0.0;
         }
     }
+    out
+}
+
+/// Particle / audio side-effects for one tick. Must not run while `STATE` is held.
+pub fn emit_frame_fx(
+    host: &mut dyn ClientHost,
+    manager: &ModuleManager,
+    trackers: &mut Trackers,
+    fx: &mut FxState,
+    theme: &Theme,
+    now: u64,
+) {
+    if !visuals_on(manager) {
+        trackers.drain_hits();
+        return;
+    }
+    emit_hits(host, manager, trackers, fx, theme, now);
+    emit_ambient(host, manager, fx, theme, now);
+    maybe_audio_warp(host, manager, fx, now);
 }
 
 fn biome_signature(manager: &ModuleManager, trip: f32) -> u64 {

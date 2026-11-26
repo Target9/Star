@@ -1,7 +1,8 @@
 //! Star — Meteor-inspired modular client for Horizon (Minecraft 26.3 in Rust).
 //!
-//! Press Right Shift (customizable in the Settings tab) while in a world
-//! to open the ClickGUI.
+//! Press Right Shift (customizable in the Settings tab) anywhere in a world —
+//! including over the pause menu, inventory, or other GUIs — to open the ClickGUI.
+//! Any open screen is closed first so the menu can take over.
 
 mod config;
 mod entity_filter;
@@ -190,7 +191,23 @@ fn handle_bind_release(host: &mut dyn ClientHost, key: &str) {
     }
 }
 
-fn handle_bind_press(host: &mut dyn ClientHost, key: &str) {
+/// Opens the ClickGUI, closing any obstructing screen (pause, inventory, nested
+/// options, chat, …) first. `mod_screen_open` only succeeds with nothing over the
+/// world, so we peel screens until it opens or `close_screen` can do no more.
+fn open_click_gui(host: &mut dyn ClientHost) {
+    for _ in 0..8 {
+        if host.mod_screen_open(MOD_ID) {
+            return;
+        }
+        if !host.close_screen() {
+            return;
+        }
+    }
+}
+
+/// Returns true when the press opened or closed the ClickGUI (so callers can
+/// cancel the underlying input).
+fn handle_bind_press(host: &mut dyn ClientHost, key: &str) -> bool {
     let action = {
         let mut st = lock_state();
         if !st.manager.config_loaded {
@@ -205,10 +222,10 @@ fn handle_bind_press(host: &mut dyn ClientHost, key: &str) {
             if configured_key == key {
                 if own_screen {
                     BindAction::CloseGui
-                } else if host.playing() {
-                    BindAction::OpenGui
                 } else {
-                    BindAction::None
+                    // Open over gameplay or after closing whatever GUI is up
+                    // (pause menu, inventory, chat, etc.).
+                    BindAction::OpenGui
                 }
             } else if host.playing() {
                 let before = enabled_snapshot(&st.manager);
@@ -225,12 +242,14 @@ fn handle_bind_press(host: &mut dyn ClientHost, key: &str) {
 
     match action {
         BindAction::OpenGui => {
-            let _ = host.mod_screen_open(MOD_ID);
+            open_click_gui(host);
+            true
         }
         BindAction::CloseGui => {
             host.mod_screen_close(MOD_ID);
+            true
         }
-        BindAction::None => {}
+        BindAction::None => false,
     }
 }
 
@@ -334,15 +353,29 @@ fn tick_pre(host: &mut dyn ClientHost) {
     });
 
     guard::run(VIS_OWNERS, (), || {
-        let mut st = lock_state();
-        let theme = Theme::from_manager(&st.manager, host.millis());
-        let ClientState {
-            manager,
-            trackers,
-            fx,
-            ..
-        } = &mut *st;
-        vis_fx::on_tick(host, manager, trackers, fx, &theme);
+        // Host APIs can re-enter hooks that also lock STATE. Drop the mutex before
+        // refresh_biome_colors (and keep particle/audio on a separate short lock so a
+        // biome rebuild never runs while STATE is held).
+        let now = host.millis();
+        let refresh = {
+            let mut st = lock_state();
+            let ClientState { manager, fx, .. } = &mut *st;
+            vis_fx::on_tick(now, manager, fx).refresh_biomes
+        };
+        {
+            let mut st = lock_state();
+            let theme = Theme::from_manager(&st.manager, now);
+            let ClientState {
+                manager,
+                trackers,
+                fx,
+                ..
+            } = &mut *st;
+            vis_fx::emit_frame_fx(host, manager, trackers, fx, &theme, now);
+        }
+        if refresh {
+            host.refresh_biome_colors();
+        }
     });
 
     guard::run(&[ModuleId::AimAssist], (), || {
@@ -372,7 +405,7 @@ impl mod_api::Hooks for Mod {
         // cannot probe translation keys or keybind components on join.
         let _ = registrar.register_setting(
             SettingSpec::toggle("enabled", "Enable Star", true).tooltip(
-                "Master switch for all modules and overlays. Press Right Shift in-game to open the ClickGUI.",
+                "Master switch for all modules and overlays. Press Right Shift anywhere in a world (pause menu included) to open the ClickGUI.",
             ),
         );
 
@@ -420,7 +453,9 @@ impl mod_api::Hooks for Mod {
                 return;
             }
             match event.action {
-                KeyAction::Press => handle_bind_press(host, event.key),
+                KeyAction::Press => {
+                    let _ = handle_bind_press(host, event.key);
+                }
                 KeyAction::Release => handle_bind_release(host, event.key),
                 _ => {}
             }
@@ -444,7 +479,10 @@ impl mod_api::Hooks for Mod {
                 return Flow::Continue;
             };
             if event.pressed {
-                handle_bind_press(host, key);
+                // Cancel so inventory/pause/etc. don't also act on the click.
+                if handle_bind_press(host, key) {
+                    return Flow::Cancel;
+                }
             } else {
                 handle_bind_release(host, key);
             }
@@ -621,7 +659,13 @@ impl mod_api::Hooks for Mod {
             if !mod_active(host) {
                 return;
             }
-            let st = lock_state();
+            // try_lock: refresh_biome_colors may re-enter this hook. If the tick
+            // path still held STATE we'd deadlock with a blocking lock.
+            let st = match state().try_lock() {
+                Ok(g) => g,
+                Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => return,
+            };
             vis_fx::apply_biome_colors(&st.manager, &st.fx, host.millis(), event);
         });
     }
@@ -848,13 +892,31 @@ impl mod_api::Hooks for Mod {
         event: &mut ScreenKeyPressedPreEvent<'_>,
     ) -> Flow {
         guard::run(&[], Flow::Continue, || {
-            if host.mod_screen() != Some(MOD_ID) {
+            if !mod_active(host) {
                 return Flow::Continue;
             }
-            let mut st = lock_state();
-            let ClientState { manager, gui, .. } = &mut *st;
-            if gui.key_pressed(event.key, manager) {
-                config::save(host, manager);
+            if host.mod_screen() == Some(MOD_ID) {
+                let mut st = lock_state();
+                let ClientState { manager, gui, .. } = &mut *st;
+                if gui.key_pressed(event.key, manager) {
+                    config::save(host, manager);
+                    return Flow::Cancel;
+                }
+                return Flow::Continue;
+            }
+            // Steal the open key from pause/inventory/chat/etc. so those screens
+            // don't consume it; `input_key` (mutable host) opens the ClickGUI after.
+            if event.repeat {
+                return Flow::Continue;
+            }
+            let configured = {
+                let st = lock_state();
+                st.manager
+                    .gui_key()
+                    .unwrap_or(DEFAULT_GUI_KEY)
+                    .to_owned()
+            };
+            if configured == event.key {
                 return Flow::Cancel;
             }
             Flow::Continue

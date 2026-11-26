@@ -615,7 +615,7 @@ fn build_click_gui_module() -> Module {
             Setting::keybind(
                 "gui_key",
                 "Open Key",
-                "Key used to open and close the ClickGUI while playing.",
+                "Key used to open and close the ClickGUI anywhere in a world, including over the pause menu and other GUIs.",
                 Some("key.keyboard.right.shift"),
             )
             .group("Controls"),
