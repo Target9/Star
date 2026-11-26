@@ -4,4 +4,7 @@ pub mod fast_mine;
 pub mod lock_visuals;
 pub mod movement;
 pub mod trackers;
+pub mod vis_fx;
+pub mod vis_presets;
+pub mod vis_settings;
 pub mod visuals;

@@ -44,6 +44,27 @@ pub struct DamagePopup {
     pub born_ms: u64,
 }
 
+/// Kind of melee/projectile damage event for Visuals Hit FX.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HitKind {
+    Normal,
+    Crit,
+    Kill,
+}
+
+/// One damage event attributed to the local player, for particle bursts.
+#[derive(Clone, Copy, Debug)]
+pub struct HitEvent {
+    pub entity_id: u32,
+    pub pos: [f64; 3],
+    #[allow(dead_code)]
+    pub amount: f32,
+    pub kind: HitKind,
+    pub born_ms: u64,
+}
+
+const MAX_HIT_EVENTS: usize = 24;
+
 #[derive(Clone, Debug)]
 pub struct ProjectilePath {
     pub points: Vec<[f64; 3]>,
@@ -136,6 +157,10 @@ pub struct Trackers {
     // Damage indicators.
     health_prev: HashMap<u32, f32>,
     popups: Vec<DamagePopup>,
+    /// Recent hits for Visuals Hit FX (drained each tick by `vis_fx`).
+    hits: Vec<HitEvent>,
+    /// Last time the attack key went down, for fallback attribution.
+    last_attack_ms: u64,
 
     // Trajectories.
     paths: Vec<ProjectilePath>,
@@ -191,6 +216,11 @@ impl Trackers {
         &self.popups
     }
 
+    /// Take and clear queued Visuals hit events.
+    pub fn drain_hits(&mut self) -> Vec<HitEvent> {
+        std::mem::take(&mut self.hits)
+    }
+
     pub fn paths(&self) -> &[ProjectilePath] {
         &self.paths
     }
@@ -214,6 +244,7 @@ impl Trackers {
         self.trails.clear();
         self.health_prev.clear();
         self.popups.clear();
+        self.hits.clear();
         self.paths.clear();
         self.proj_owner.clear();
         self.storage.clear();
@@ -247,6 +278,7 @@ impl Trackers {
         let use_item = down("key.use");
         if attack && !self.attack_was_down {
             self.left_clicks.push_back(now);
+            self.last_attack_ms = now;
         }
         if use_item && !self.use_was_down {
             self.right_clicks.push_back(now);
@@ -280,11 +312,13 @@ impl Trackers {
 
         let breadcrumbs = manager.get(ModuleId::Breadcrumbs);
         let damage = manager.get(ModuleId::DamageIndicators);
+        let hit_fx = manager.get(ModuleId::VisHit);
         let trajectories = manager.get(ModuleId::Trajectories);
         let storage = manager.get(ModuleId::StorageEsp);
 
         let trail_self = breadcrumbs.enabled && breadcrumbs.mode("source", 0) == 0;
         let trail_others = breadcrumbs.enabled && breadcrumbs.mode("source", 0) == 1;
+        let want_hits = hit_fx.enabled && hit_fx.bool("enabled_fx", false);
         if breadcrumbs.enabled {
             let max_len = breadcrumbs.int("length", 100).clamp(10, 600) as usize;
             if trail_self {
@@ -297,7 +331,7 @@ impl Trackers {
             self.trails.clear();
         }
 
-        let need_entities = trail_others || damage.enabled || trajectories.enabled;
+        let need_entities = trail_others || damage.enabled || trajectories.enabled || want_hits;
         if need_entities {
             let mut pad: f64 = 0.0;
             if trail_others {
@@ -305,6 +339,9 @@ impl Trackers {
             }
             if damage.enabled {
                 pad = pad.max(damage.float("range", 32.0));
+            }
+            if want_hits {
+                pad = pad.max(hit_fx.float("range", 12.0));
             }
             if trajectories.enabled {
                 pad = pad.max(trajectories.float("range", 64.0));
@@ -314,7 +351,7 @@ impl Trackers {
             if trail_others {
                 self.sample_trails(host, manager, player, pos, &entities);
             }
-            if damage.enabled {
+            if damage.enabled || want_hits {
                 self.sample_damage(host, manager, player, pos, &entities);
             } else {
                 self.health_prev.clear();
@@ -469,14 +506,22 @@ impl Trackers {
         origin: [f64; 3],
         entities: &[EntityRef],
     ) {
-        let module = manager.get(ModuleId::DamageIndicators);
-        let Some(filter) = module.entity_filter("entities") else {
+        let indicators = manager.get(ModuleId::DamageIndicators);
+        let hit_fx = manager.get(ModuleId::VisHit);
+        let want_popups = indicators.enabled;
+        let want_hits = hit_fx.enabled && hit_fx.bool("enabled_fx", false);
+        if !want_popups && !want_hits {
             return;
-        };
-        let range = module.float("range", 32.0);
-        let only_mine = module.bool("only_mine", false);
-        let show_heal = module.bool("show_healing", false);
+        }
+
+        let filter = indicators.entity_filter("entities");
+        let popup_range = indicators.float("range", 32.0);
+        let hit_range = hit_fx.float("range", 12.0);
+        let only_mine_popup = indicators.bool("only_mine", false);
+        let only_mine_hit = hit_fx.bool("only_mine", true);
+        let show_heal = indicators.bool("show_healing", false);
         let now = host.millis();
+        let scan_range = popup_range.max(hit_range);
 
         let mut seen: Vec<u32> = Vec::with_capacity(entities.len());
         for entity in entities {
@@ -492,9 +537,8 @@ impl Trackers {
             let Some(kind) = entity.kind(host) else {
                 continue;
             };
-            if !filter.contains(&kind.id(host)) {
-                continue;
-            }
+            let kind_id = kind.id(host);
+            let passes_filter = filter.is_none_or(|f| f.contains(&kind_id));
             let Some(bb) = entity.bounding_box(host) else {
                 continue;
             };
@@ -503,7 +547,8 @@ impl Trackers {
                 bb[1][1],
                 (bb[0][2] + bb[1][2]) * 0.5,
             ];
-            if sq_dist(origin, center) > range * range {
+            let dist_sq = sq_dist(origin, center);
+            if dist_sq > scan_range * scan_range {
                 continue;
             }
             seen.push(entity.id());
@@ -516,28 +561,54 @@ impl Trackers {
             let delta = hp - prev;
             let is_damage = delta < -0.05;
             let is_heal = delta > 0.5;
-            if !(is_damage || (is_heal && show_heal)) {
+            if !is_damage && !(is_heal && show_heal && want_popups) {
                 continue;
             }
-            if is_damage
-                && only_mine
-                && !living
-                    .last_attacker(host)
-                    .is_some_and(|a| a.id() == player.id())
-            {
-                continue;
+
+            let mine = living
+                .last_attacker(host)
+                .is_some_and(|a| a.id() == player.id())
+                || now.saturating_sub(self.last_attack_ms) < 350;
+
+            if want_popups && passes_filter && dist_sq <= popup_range * popup_range {
+                let allow = !is_damage || !only_mine_popup || mine;
+                if allow && (is_damage || is_heal) {
+                    if self.popups.len() >= MAX_POPUPS {
+                        self.popups.remove(0);
+                    }
+                    let jitter =
+                        ((id.wrapping_mul(2654435761) ^ (now as u32)) % 100) as f64 / 100.0 - 0.5;
+                    self.popups.push(DamagePopup {
+                        pos: [center[0] + jitter * 0.6, center[1] + 0.25, center[2]],
+                        amount: delta.abs(),
+                        heal: is_heal && !is_damage,
+                        born_ms: now,
+                    });
+                }
             }
-            if self.popups.len() >= MAX_POPUPS {
-                self.popups.remove(0);
+
+            if want_hits && is_damage && dist_sq <= hit_range * hit_range {
+                let allow = !only_mine_hit || mine;
+                if allow {
+                    if self.hits.len() >= MAX_HIT_EVENTS {
+                        self.hits.remove(0);
+                    }
+                    let kind = if hp <= 0.0 {
+                        HitKind::Kill
+                    } else if delta.abs() >= 6.0 {
+                        HitKind::Crit
+                    } else {
+                        HitKind::Normal
+                    };
+                    self.hits.push(HitEvent {
+                        entity_id: id,
+                        pos: center,
+                        amount: delta.abs(),
+                        kind,
+                        born_ms: now,
+                    });
+                }
             }
-            // Spread simultaneous popups sideways so they don't stack on one pixel.
-            let jitter = ((id.wrapping_mul(2654435761) ^ (now as u32)) % 100) as f64 / 100.0 - 0.5;
-            self.popups.push(DamagePopup {
-                pos: [center[0] + jitter * 0.6, center[1] + 0.25, center[2]],
-                amount: delta.abs(),
-                heal: is_heal && !is_damage,
-                born_ms: now,
-            });
         }
         self.health_prev.retain(|id, _| seen.contains(id));
         self.popups

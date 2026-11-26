@@ -1,7 +1,7 @@
 //! Meteor-inspired ClickGUI rendered on Horizon's mod screen (`host.mod_screen_open("star")`).
 //!
 //! Features:
-//! - Top navigation tabs: `Modules` | `Settings` | `HUD` | `Profiles`
+//! - Top navigation tabs: `Modules` | `Settings` | `HUD` | `Visuals` | `Profiles`
 //! - Draggable, collapsible, scrollable category panels on the `Modules` tab
 //! - Dedicated centered settings cards for Client Settings (Theme, Font, Layout, Colors) & HUD
 //! - Reusable floating Entity Selector modal window for exact entity-type filtering
@@ -15,6 +15,8 @@ use crate::font::{FontConfig, FontFace};
 use crate::hud;
 use crate::module::{BindMode, Category, ModuleId, ModuleManager};
 use crate::modules::trackers::Trackers;
+use crate::modules::vis_fx;
+use crate::modules::vis_presets::{self, PRESET_CARDS};
 use crate::settings::{SettingKind, format_key_name};
 use crate::theme::{Theme, with_alpha};
 
@@ -42,18 +44,78 @@ pub enum GuiTab {
     Modules,
     Settings,
     Hud,
+    Visuals,
     Profiles,
 }
 
 impl GuiTab {
-    const ALL: [GuiTab; 4] = [GuiTab::Modules, GuiTab::Settings, GuiTab::Hud, GuiTab::Profiles];
+    const ALL: [GuiTab; 5] = [
+        GuiTab::Modules,
+        GuiTab::Settings,
+        GuiTab::Hud,
+        GuiTab::Visuals,
+        GuiTab::Profiles,
+    ];
 
     fn label(self) -> &'static str {
         match self {
             Self::Modules => "Modules",
             Self::Settings => "Settings",
             Self::Hud => "HUD",
+            Self::Visuals => "Visuals",
             Self::Profiles => "Profiles",
+        }
+    }
+}
+
+/// Sub-pages inside the Visuals tab.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VisSection {
+    Presets,
+    Sky,
+    World,
+    Camera,
+    Screen,
+    Hit,
+    Ambient,
+    Trip,
+}
+
+impl VisSection {
+    const ALL: [VisSection; 8] = [
+        VisSection::Presets,
+        VisSection::Sky,
+        VisSection::World,
+        VisSection::Camera,
+        VisSection::Screen,
+        VisSection::Hit,
+        VisSection::Ambient,
+        VisSection::Trip,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Presets => "Presets",
+            Self::Sky => "Sky & Fog",
+            Self::World => "World",
+            Self::Camera => "Camera",
+            Self::Screen => "Screen",
+            Self::Hit => "Hit FX",
+            Self::Ambient => "Ambient",
+            Self::Trip => "Trip",
+        }
+    }
+
+    fn module_id(self) -> Option<ModuleId> {
+        match self {
+            Self::Presets => Some(ModuleId::VisPreset),
+            Self::Sky => Some(ModuleId::VisSky),
+            Self::World => Some(ModuleId::VisWorld),
+            Self::Camera => Some(ModuleId::VisCamera),
+            Self::Screen => Some(ModuleId::VisScreen),
+            Self::Hit => Some(ModuleId::VisHit),
+            Self::Ambient => Some(ModuleId::VisAmbient),
+            Self::Trip => Some(ModuleId::VisTrip),
         }
     }
 }
@@ -111,6 +173,8 @@ pub struct ClickGuiState {
     last_frame_ms: Option<u64>,
     settings_scroll: f32,
     hud_scroll: f32,
+    visuals_scroll: f32,
+    visuals_section: VisSection,
     profile_name: String,
     profile_name_focused: bool,
     profile_error: Option<String>,
@@ -144,6 +208,8 @@ impl Default for ClickGuiState {
             last_frame_ms: None,
             settings_scroll: 0.0,
             hud_scroll: 0.0,
+            visuals_scroll: 0.0,
+            visuals_section: VisSection::Presets,
             profile_name: String::new(),
             profile_name_focused: false,
             profile_error: None,
@@ -213,6 +279,8 @@ struct HitRegion {
 #[derive(Clone, Debug)]
 enum HitKind {
     Tab(GuiTab),
+    VisSection(VisSection),
+    VisPreset(usize),
     SearchBar,
     SearchClear,
     ResetLayout,
@@ -413,6 +481,9 @@ impl ClickGuiState {
                     font,
                 );
             }
+            GuiTab::Visuals => {
+                self.render_visuals(draw, size, bg_mouse, manager, &theme, font);
+            }
             GuiTab::Profiles => {
                 self.render_profiles(draw, size, bg_mouse, manager, &theme, font);
             }
@@ -562,7 +633,7 @@ impl ClickGuiState {
         // Brand title on left
         let title = "STAR";
         // The Horizon launcher compiles with plain rustc, so Cargo's env vars do not exist.
-        let ver = "v0.3.0";
+        let ver = "v0.4.0";
         let ty = font.center_y(0.0, TOP_BAR_H - 1.0);
         font.draw_header(draw, title, [10.0, ty], theme.accent);
         let title_w = font.width(draw, title, font.bold_headers);
@@ -1097,10 +1168,10 @@ impl ClickGuiState {
         let total_h = card_header_h + body_h;
         let max_scroll = (content_h - body_h).max(0.0);
 
-        let scroll_ref = if self.active_tab == GuiTab::Settings {
-            &mut self.settings_scroll
-        } else {
-            &mut self.hud_scroll
+        let scroll_ref = match self.active_tab {
+            GuiTab::Settings => &mut self.settings_scroll,
+            GuiTab::Visuals => &mut self.visuals_scroll,
+            _ => &mut self.hud_scroll,
         };
         *scroll_ref = scroll_ref.clamp(0.0, max_scroll);
         let scroll = *scroll_ref;
@@ -1142,6 +1213,263 @@ impl ClickGuiState {
                 rect: sw_rect,
                 kind: HitKind::ToggleModuleEnabled(mod_idx),
                 tooltip: Some("Enable or disable the HUD overlay.".into()),
+            });
+        }
+
+        let body_rect = [card_x, card_y + card_header_h, card_w, body_h];
+        draw.fill(body_rect, theme.panel_bg);
+        self.card_scroll_rect = Some((body_rect, max_scroll));
+
+        let clipped = draw.push_clip(body_rect).is_ok();
+        let _ = self.render_settings_list(
+            draw,
+            mod_idx,
+            card_x,
+            card_y + card_header_h + 2.0 - scroll,
+            card_w,
+            body_rect,
+            mouse,
+            manager,
+            theme,
+            font,
+            false,
+        );
+        if clipped {
+            let _ = draw.pop_clip();
+        }
+
+        if max_scroll > 0.5 {
+            let track_x = card_x + card_w - 3.5;
+            let thumb_h = ((body_h / content_h) * body_h).clamp(16.0, body_h);
+            let thumb_y = body_rect[1] + (scroll / max_scroll) * (body_h - thumb_h);
+            draw.fill([track_x, thumb_y, 2.5, thumb_h], with_alpha(theme.accent, 0xC4));
+        }
+
+        draw_outline(draw, card_rect, theme.border);
+    }
+
+    /// Visuals tab: section pills + preset grid or a settings card.
+    #[allow(clippy::too_many_arguments)]
+    fn render_visuals(
+        &mut self,
+        draw: &mut dyn DrawContext,
+        size: [f32; 2],
+        mouse: [f32; 2],
+        manager: &mut ModuleManager,
+        theme: &Theme,
+        font: FontConfig,
+    ) {
+        let mut pill_x = 14.0;
+        let pill_y = TOP_BAR_H + 6.0;
+        let pill_h = 16.0;
+        for section in VisSection::ALL {
+            let label = section.label();
+            let active = self.visuals_section == section;
+            let lw = font.width(draw, label, active && font.bold_headers);
+            let pill_w = (lw + 12.0).max(40.0);
+            let rect = [pill_x, pill_y, pill_w, pill_h];
+            let hover = rect_contains(rect, mouse);
+            if active {
+                draw.fill(rect, with_alpha(theme.accent, 0x40));
+                draw.fill([pill_x, pill_y + pill_h - 1.5, pill_w, 1.5], theme.accent);
+            } else if hover {
+                draw.fill(rect, with_alpha(theme.module_hover, 0xCC));
+            }
+            let tx = pill_x + (pill_w - lw) * 0.5;
+            let ty = font.center_y(pill_y, pill_h);
+            if active {
+                font.draw_header(draw, label, [tx, ty], theme.text);
+            } else {
+                font.draw_body(
+                    draw,
+                    label,
+                    [tx, ty],
+                    if hover { theme.text } else { theme.text_muted },
+                );
+            }
+            self.hits.push(HitRegion {
+                rect,
+                kind: HitKind::VisSection(section),
+                tooltip: None,
+            });
+            pill_x += pill_w + 4.0;
+        }
+
+        if self.visuals_section == VisSection::Presets {
+            self.render_visuals_presets(draw, size, mouse, manager, theme, font);
+        } else if let Some(id) = self.visuals_section.module_id() {
+            let idx = manager.index_of(id);
+            let (title, subtitle, toggle) = match self.visuals_section {
+                VisSection::Sky => ("Sky & Fog", "Sky dome, fog tint, density and breathing.", false),
+                VisSection::World => ("World", "Biome tints, glow rims and coloured lights.", false),
+                VisSection::Camera => ("Camera FX", "FOV, sway, roll and hit punch.", false),
+                VisSection::Screen => ("Screen", "Vignette, wash, scanlines and hit flash.", false),
+                VisSection::Hit => ("Hit FX", "Particle bursts when you land a hit.", true),
+                VisSection::Ambient => ("Ambient", "Floating particles around you.", false),
+                VisSection::Trip => ("Trip", "LSD-style effects scaled by Dose.", false),
+                VisSection::Presets => unreachable!(),
+            };
+            // Leave room for the section pills.
+            let saved_y_pad = TOP_BAR_H + 28.0;
+            // Temporarily shift by rendering a card with extra top offset via a local clone of layout.
+            self.render_visuals_settings_card(
+                draw,
+                idx,
+                title,
+                subtitle,
+                toggle || id == ModuleId::VisPreset,
+                size,
+                mouse,
+                manager,
+                theme,
+                font,
+                saved_y_pad,
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_visuals_presets(
+        &mut self,
+        draw: &mut dyn DrawContext,
+        size: [f32; 2],
+        mouse: [f32; 2],
+        manager: &ModuleManager,
+        theme: &Theme,
+        font: FontConfig,
+    ) {
+        let active = manager.get(ModuleId::VisPreset).mode("preset", 0);
+        let dose = manager.get(ModuleId::VisPreset).float("dose", 0.0);
+        let top = TOP_BAR_H + 28.0;
+        let card_w = ((size[0] - 48.0) / 3.0).clamp(110.0, 160.0);
+        let gap = 8.0;
+        let cols = 3usize;
+        let total_w = cols as f32 * card_w + (cols - 1) as f32 * gap;
+        let start_x = ((size[0] - total_w) * 0.5).max(12.0);
+        let card_h = 54.0;
+
+        for (i, card) in PRESET_CARDS.iter().enumerate() {
+            let col = i % cols;
+            let row = i / cols;
+            let x = start_x + col as f32 * (card_w + gap);
+            let y = top + row as f32 * (card_h + gap);
+            let rect = [x, y, card_w, card_h];
+            let hover = rect_contains(rect, mouse);
+            let selected = active == i;
+            draw.fill(
+                rect,
+                if selected {
+                    with_alpha(theme.accent, 0x38)
+                } else if hover {
+                    theme.module_hover
+                } else {
+                    theme.panel_bg
+                },
+            );
+            if selected {
+                draw_outline(draw, rect, theme.accent);
+            } else {
+                draw_outline(draw, rect, theme.border);
+            }
+            // Swatches
+            draw.fill([x + 6.0, y + 6.0, 14.0, 14.0], card.swatch_a);
+            draw.fill([x + 22.0, y + 6.0, 14.0, 14.0], card.swatch_b);
+            font.draw_header(draw, card.name, [x + 42.0, y + 7.0], theme.text);
+            font.draw_fitted(
+                draw,
+                card.blurb,
+                [x + 6.0, y + 28.0],
+                card_w - 12.0,
+                theme.text_muted,
+                false,
+                false,
+            );
+            self.hits.push(HitRegion {
+                rect,
+                kind: HitKind::VisPreset(i),
+                tooltip: Some(format!("Apply the {} preset.", card.name)),
+            });
+        }
+
+        // Dose readout under the grid.
+        let rows = (PRESET_CARDS.len() + cols - 1) / cols;
+        let y = top + rows as f32 * (card_h + gap) + 4.0;
+        let dose_line = format!("Dose  {dose:.2}x   (tune on Presets module / Trip page)");
+        let dw = font.width(draw, &dose_line, false);
+        font.draw_body(
+            draw,
+            &dose_line,
+            [((size[0] - dw) * 0.5).max(8.0), y],
+            theme.text_muted,
+        );
+    }
+
+    /// Settings card with a custom top Y (under Visuals section pills).
+    #[allow(clippy::too_many_arguments)]
+    fn render_visuals_settings_card(
+        &mut self,
+        draw: &mut dyn DrawContext,
+        mod_idx: usize,
+        title: &str,
+        subtitle: &str,
+        show_enable_toggle: bool,
+        size: [f32; 2],
+        mouse: [f32; 2],
+        manager: &mut ModuleManager,
+        theme: &Theme,
+        font: FontConfig,
+        card_y: f32,
+    ) {
+        let card_w = (size[0] - 48.0).clamp(240.0, 340.0);
+        let card_x = (size[0] - card_w) * 0.5;
+        let max_card_h = (size[1] - card_y - FOOTER_H - 12.0).max(80.0);
+        let card_header_h = 30.0;
+
+        let content_h = module_drawer_height(&manager.modules[mod_idx], false) + 8.0;
+        let body_h = content_h.min(max_card_h - card_header_h).max(40.0);
+        let total_h = card_header_h + body_h;
+        let max_scroll = (content_h - body_h).max(0.0);
+
+        self.visuals_scroll = self.visuals_scroll.clamp(0.0, max_scroll);
+        let scroll = self.visuals_scroll;
+
+        let card_rect = [card_x, card_y, card_w, total_h];
+        draw.fill([card_x + 3.0, card_y + 3.0, card_w, total_h], 0x5500_0000);
+        draw.fill([card_x, card_y, card_w, card_header_h], theme.header_bg);
+        draw.fill([card_x, card_y, card_w, 2.0], theme.accent);
+
+        font.draw_header(draw, title, [card_x + 10.0, card_y + 6.0], theme.text);
+        font.draw_fitted(
+            draw,
+            subtitle,
+            [card_x + 10.0, card_y + 17.5],
+            card_w - 60.0,
+            theme.text_muted,
+            false,
+            false,
+        );
+
+        if show_enable_toggle {
+            let enabled = manager.modules[mod_idx].enabled;
+            let sw_w = 22.0;
+            let sw_h = 11.0;
+            let sw_x = card_x + card_w - sw_w - 10.0;
+            let sw_y = card_y + (card_header_h - sw_h) * 0.5;
+            let sw_rect = [sw_x, sw_y, sw_w, sw_h];
+            draw.fill(
+                sw_rect,
+                if enabled {
+                    theme.accent
+                } else {
+                    theme.slider_track
+                },
+            );
+            let knob_x = if enabled { sw_x + sw_w - 9.0 } else { sw_x + 1.5 };
+            draw.fill([knob_x, sw_y + 1.5, 7.5, sw_h - 3.0], 0xFFFF_FFFF);
+            self.hits.push(HitRegion {
+                rect: sw_rect,
+                kind: HitKind::ToggleModuleEnabled(mod_idx),
+                tooltip: Some("Enable or disable this Visuals section.".into()),
             });
         }
 
@@ -2210,6 +2538,8 @@ impl ClickGuiState {
             "Create, load, and save profiles  |  Copy / Paste shares a config  |  ESC Close"
         } else if self.active_tab == GuiTab::Hud {
             "Drag a widget outline to move it  |  RMB resets it  |  LMB Toggle  |  ESC Close"
+        } else if self.active_tab == GuiTab::Visuals {
+            "Pick a preset or tune Sky / Hit FX / Trip  |  Dose scales LSD  |  ESC Close"
         } else {
             "LMB Toggle / Drag Slider  |  RMB Reset Setting  |  Scroll to browse  |  ESC Close"
         };
@@ -2815,6 +3145,26 @@ impl ClickGuiState {
                 }
                 true
             }
+            HitKind::VisSection(section) => {
+                if button == 0 {
+                    self.visuals_section = section;
+                    self.visuals_scroll = 0.0;
+                    self.open_dropdown = None;
+                }
+                true
+            }
+            HitKind::VisPreset(idx) => {
+                if button == 0 {
+                    let changed = vis_presets::apply_preset_index(manager, idx);
+                    if changed > 0 || idx == 6 {
+                        if let Some(card) = PRESET_CARDS.get(idx) {
+                            vis_fx::notify_preset(card.name);
+                        }
+                        manager.dirty = true;
+                    }
+                }
+                true
+            }
             HitKind::SearchBar => {
                 if button == 0 {
                     self.search_focused = true;
@@ -3018,6 +3368,8 @@ impl ClickGuiState {
                 option_idx,
             } => {
                 if button == 0 {
+                    let is_vis_preset = manager.modules[mod_idx].id == ModuleId::VisPreset
+                        && manager.modules[mod_idx].settings[set_idx].id == "preset";
                     let setting = &mut manager.modules[mod_idx].settings[set_idx];
                     if let SettingKind::Mode { index, options, .. } = &mut setting.kind
                         && option_idx < options.len()
@@ -3026,6 +3378,12 @@ impl ClickGuiState {
                         manager.dirty = true;
                     }
                     self.open_dropdown = None;
+                    if is_vis_preset {
+                        let _ = vis_presets::apply_preset_index(manager, option_idx);
+                        if let Some(card) = PRESET_CARDS.get(option_idx) {
+                            vis_fx::notify_preset(card.name);
+                        }
+                    }
                 }
                 true
             }
@@ -3337,10 +3695,10 @@ impl ClickGuiState {
             && rect_contains(rect, mouse)
             && max_scroll > 0.5
         {
-            let s = if self.active_tab == GuiTab::Settings {
-                &mut self.settings_scroll
-            } else {
-                &mut self.hud_scroll
+            let s = match self.active_tab {
+                GuiTab::Settings => &mut self.settings_scroll,
+                GuiTab::Visuals => &mut self.visuals_scroll,
+                _ => &mut self.hud_scroll,
             };
             *s = (*s - scroll_y as f32 * 18.0).clamp(0.0, max_scroll);
             return true;

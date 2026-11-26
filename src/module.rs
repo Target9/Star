@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use crate::entity_filter::EntityFilter;
 use crate::font::{DEFAULT_FONT_INDEX, FONT_PRESETS};
-use crate::modules::{aim_assist, extras, fast_mine, lock_visuals, movement, visuals};
+use crate::modules::{aim_assist, extras, fast_mine, lock_visuals, movement, vis_settings, visuals};
 use crate::settings::Setting;
 use crate::theme::THEME_PRESETS;
 
@@ -17,15 +17,17 @@ pub enum Category {
     Movement,
     Render,
     Client,
+    Visuals,
 }
 
 impl Category {
-    pub const ALL: [Category; 5] = [
+    pub const ALL: [Category; 6] = [
         Category::Combat,
         Category::Player,
         Category::Movement,
         Category::Render,
         Category::Client,
+        Category::Visuals,
     ];
 
     /// Categories displayed as draggable panels on the main `Modules` tab.
@@ -43,6 +45,7 @@ impl Category {
             Category::Movement => 2,
             Category::Render => 3,
             Category::Client => 4,
+            Category::Visuals => 5,
         }
     }
 
@@ -53,6 +56,7 @@ impl Category {
             Category::Movement => "movement",
             Category::Render => "render",
             Category::Client => "client",
+            Category::Visuals => "visuals",
         }
     }
 
@@ -63,6 +67,7 @@ impl Category {
             Category::Movement => "Movement",
             Category::Render => "Render",
             Category::Client => "Client",
+            Category::Visuals => "Visuals",
         }
     }
 
@@ -73,6 +78,7 @@ impl Category {
             Category::Movement => "M",
             Category::Render => "R",
             Category::Client => "S",
+            Category::Visuals => "V",
         }
     }
 
@@ -102,13 +108,21 @@ pub enum ModuleId {
     Sprint,
     ToggleSneak,
     AutoWalk,
+    VisPreset,
+    VisSky,
+    VisWorld,
+    VisCamera,
+    VisScreen,
+    VisHit,
+    VisAmbient,
+    VisTrip,
     Hud,
     ClickGui,
 }
 
 impl ModuleId {
     /// Every module id, in registration order.
-    pub const ALL: [ModuleId; 20] = [
+    pub const ALL: [ModuleId; 28] = [
         ModuleId::AimAssist,
         ModuleId::LockVisuals,
         ModuleId::FastMine,
@@ -127,6 +141,14 @@ impl ModuleId {
         ModuleId::Sprint,
         ModuleId::ToggleSneak,
         ModuleId::AutoWalk,
+        ModuleId::VisPreset,
+        ModuleId::VisSky,
+        ModuleId::VisWorld,
+        ModuleId::VisCamera,
+        ModuleId::VisScreen,
+        ModuleId::VisHit,
+        ModuleId::VisAmbient,
+        ModuleId::VisTrip,
         ModuleId::Hud,
         ModuleId::ClickGui,
     ];
@@ -260,6 +282,14 @@ impl Module {
             | ModuleId::Camera
             | ModuleId::ToggleSneak
             | ModuleId::AutoWalk
+            | ModuleId::VisPreset
+            | ModuleId::VisSky
+            | ModuleId::VisWorld
+            | ModuleId::VisCamera
+            | ModuleId::VisScreen
+            | ModuleId::VisHit
+            | ModuleId::VisAmbient
+            | ModuleId::VisTrip
             | ModuleId::Hud
             | ModuleId::ClickGui => None,
         }
@@ -285,7 +315,7 @@ pub struct SavedProfile {
 /// Central registry of all modules, panel layouts, profiles, and config dirty state.
 pub struct ModuleManager {
     pub modules: Vec<Module>,
-    pub panels: [PanelState; 5],
+    pub panels: [PanelState; 6],
     pub config_loaded: bool,
     pub dirty: bool,
     /// Profile last loaded or saved. Empty when the live setup doesn't match a snapshot.
@@ -333,6 +363,14 @@ impl ModuleManager {
             movement::build_sprint_module(),
             movement::build_toggle_sneak_module(),
             movement::build_auto_walk_module(),
+            vis_settings::build_preset_module(),
+            vis_settings::build_sky_module(),
+            vis_settings::build_world_module(),
+            vis_settings::build_camera_module(),
+            vis_settings::build_screen_module(),
+            vis_settings::build_hit_module(),
+            vis_settings::build_ambient_module(),
+            vis_settings::build_trip_module(),
             build_hud_module(),
             build_click_gui_module(),
         ];
@@ -547,7 +585,7 @@ impl ModuleManager {
     }
 }
 
-fn default_panels(panel_width: f32) -> [PanelState; 5] {
+fn default_panels(panel_width: f32) -> [PanelState; 6] {
     let gap = 12.0;
     let start_x = 18.0;
     let mut out = [PanelState {
@@ -555,7 +593,7 @@ fn default_panels(panel_width: f32) -> [PanelState; 5] {
         y: 38.0,
         collapsed: false,
         scroll: 0.0,
-    }; 5];
+    }; 6];
     for (i, p) in out.iter_mut().enumerate() {
         p.x = start_x + i as f32 * (panel_width + gap);
     }

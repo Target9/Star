@@ -1,10 +1,10 @@
 [package]
 name = "star"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 license = "MIT"
 publish = false
-description = "Meteor-inspired modular client for Horizon with a customizable ClickGUI, categories, HUD, and Aim Assist."
+description = "Meteor-inspired modular client for Horizon with a customizable ClickGUI, Visuals presets (PVP/LSD), categories, HUD, and Aim Assist."
 
 [dependencies]
 horizon-mod-api = { path = ".horizon/sdk/api/crates/horizon-mod-api" }

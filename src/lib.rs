@@ -19,15 +19,16 @@ mod toast;
 use std::sync::{Mutex, OnceLock};
 
 use mod_api::{
-    self, CameraDistanceEvent, CameraShakeEvent, ClientHost, ClientTickPreEvent,
-    EntityOutlineEvent, Flow, HostSide, InputKeyEvent, KeyAction, MouseButtonPreEvent,
-    MovementInputEvent, PlayerBreakSpeedEvent, Registrar, RegistrationContext, RenderFogEvent,
-    RenderFramePreEvent,
-    RenderGuiPostEvent, RenderLivingPostEvent, RenderNameTagEvent, RenderPlayerPreEvent,
+    self, BiomeColorsEvent, CameraDistanceEvent, CameraRollEvent, CameraShakeEvent, ClientHost,
+    ClientResourcesReloadedEvent, ClientSetupEvent, ClientTickPreEvent, ComputeFogColorEvent,
+    ComputeFovEvent, EntityOutlineEvent, Flow, HostSide, InputKeyEvent, KeyAction,
+    MouseButtonPreEvent, MovementInputEvent, PlayerBreakSpeedEvent, RegisterRenderPipelinesEvent,
+    Registrar, RegistrationContext, RenderFogEvent, RenderFramePreEvent, RenderGuiPostEvent,
+    RenderLevelStageEvent, RenderLivingPostEvent, RenderNameTagEvent, RenderPlayerPreEvent,
     ScreenCharTypedPreEvent, ScreenClosingEvent, ScreenKeyPressedPreEvent,
     ScreenMouseButtonPressedPreEvent, ScreenMouseButtonReleasedPreEvent,
     ScreenMouseDraggedPreEvent, ScreenMouseScrolledPreEvent, ScreenRenderPostEvent, SettingSpec,
-    SubmitCustomGeometryEvent, Zoom, ZoomEvent,
+    ShaderParamsEvent, SubmitCustomGeometryEvent, VisualsEvent, Zoom, ZoomEvent,
 };
 
 use crate::gui::{ClickGuiState, ClipboardAction};
@@ -36,7 +37,9 @@ use crate::modules::aim_assist;
 use crate::modules::lock_visuals::{self, LockBoard};
 use crate::modules::movement::{MoveConfig, MoveInputState};
 use crate::modules::trackers::Trackers;
+use crate::modules::vis_fx::{self, FxState, ParticleKeys};
 use crate::modules::{extras, fast_mine, visuals};
+use crate::theme::Theme;
 use crate::toast::{ToastKind, Toasts};
 
 const MOD_ID: &str = "star";
@@ -52,6 +55,9 @@ const HUD_OWNERS: &[ModuleId] = &[
     ModuleId::Radar,
     ModuleId::AimAssist,
     ModuleId::LockVisuals,
+    ModuleId::VisPreset,
+    ModuleId::VisScreen,
+    ModuleId::VisTrip,
 ];
 /// Modules whose code runs inside the world-geometry hook.
 const WORLD_OWNERS: &[ModuleId] = &[
@@ -63,6 +69,8 @@ const WORLD_OWNERS: &[ModuleId] = &[
     ModuleId::Breadcrumbs,
     ModuleId::AimAssist,
     ModuleId::LockVisuals,
+    ModuleId::VisSky,
+    ModuleId::VisWorld,
 ];
 /// Modules that need a per-tick world sample.
 const TICK_OWNERS: &[ModuleId] = &[
@@ -75,6 +83,20 @@ const TICK_OWNERS: &[ModuleId] = &[
     ModuleId::Nametags,
     ModuleId::ItemEsp,
     ModuleId::AimAssist,
+    ModuleId::VisHit,
+    ModuleId::VisAmbient,
+    ModuleId::VisTrip,
+];
+
+const VIS_OWNERS: &[ModuleId] = &[
+    ModuleId::VisPreset,
+    ModuleId::VisSky,
+    ModuleId::VisWorld,
+    ModuleId::VisCamera,
+    ModuleId::VisScreen,
+    ModuleId::VisHit,
+    ModuleId::VisAmbient,
+    ModuleId::VisTrip,
 ];
 
 struct ClientState {
@@ -86,6 +108,7 @@ struct ClientState {
     trackers: Trackers,
     toasts: Toasts,
     move_state: MoveInputState,
+    fx: FxState,
     /// Enabled flag of every module as of the previous tick, to notice toggles.
     prev_enabled: Vec<(ModuleId, bool)>,
 }
@@ -100,6 +123,7 @@ impl ClientState {
             trackers: Trackers::default(),
             toasts: Toasts::default(),
             move_state: MoveInputState::default(),
+            fx: FxState::default(),
             prev_enabled: Vec::new(),
         }
     }
@@ -309,6 +333,18 @@ fn tick_pre(host: &mut dyn ClientHost) {
         trackers.on_tick(host, manager);
     });
 
+    guard::run(VIS_OWNERS, (), || {
+        let mut st = lock_state();
+        let theme = Theme::from_manager(&st.manager, host.millis());
+        let ClientState {
+            manager,
+            trackers,
+            fx,
+            ..
+        } = &mut *st;
+        vis_fx::on_tick(host, manager, trackers, fx, &theme);
+    });
+
     guard::run(&[ModuleId::AimAssist], (), || {
         if aim_module.enabled && aim_module.mode("update_rate", 0) == 1 {
             let target = aim_assist::step(host, &aim_module, 1.0, false);
@@ -339,6 +375,43 @@ impl mod_api::Hooks for Mod {
                 "Master switch for all modules and overlays. Press Right Shift in-game to open the ClickGUI.",
             ),
         );
+
+        vis_fx::store_particle_keys(ParticleKeys {
+            dust: Some(registrar.particle_key("minecraft:dust")),
+            dust_transition: Some(registrar.particle_key("minecraft:dust_color_transition")),
+            end_rod: Some(registrar.particle_key("minecraft:end_rod")),
+            crit: Some(registrar.particle_key("minecraft:crit")),
+            electric_spark: Some(registrar.particle_key("minecraft:electric_spark")),
+            firework: Some(registrar.particle_key("minecraft:firework")),
+            glow: Some(registrar.particle_key("minecraft:glow")),
+            enchanted_hit: Some(registrar.particle_key("minecraft:enchanted_hit")),
+        });
+    }
+
+    fn register_render_pipelines(
+        &self,
+        _context: &RegistrationContext,
+        event: &mut RegisterRenderPipelinesEvent<'_>,
+    ) {
+        vis_fx::register_pipelines(event);
+    }
+
+    fn client_setup(&self, host: &mut dyn ClientHost, _: &mut ClientSetupEvent) {
+        guard::run(VIS_OWNERS, (), || {
+            let pipes = vis_fx::resolve_pipelines(host);
+            lock_state().fx.pipelines = pipes;
+        });
+    }
+
+    fn client_resources_reloaded(
+        &self,
+        host: &mut dyn ClientHost,
+        _: &mut ClientResourcesReloadedEvent,
+    ) {
+        guard::run(VIS_OWNERS, (), || {
+            let pipes = vis_fx::resolve_pipelines(host);
+            lock_state().fx.pipelines = pipes;
+        });
     }
 
     fn input_key(&self, host: &mut dyn ClientHost, event: &mut InputKeyEvent<'_>) {
@@ -500,12 +573,88 @@ impl mod_api::Hooks for Mod {
     }
 
     fn render_fog(&self, host: &dyn ClientHost, event: &mut RenderFogEvent<'_>) {
-        guard::run(&[ModuleId::NoFog], (), || {
+        guard::run(&[ModuleId::NoFog, ModuleId::VisSky, ModuleId::VisTrip], (), || {
             if !mod_active(host) {
                 return;
             }
-            let no_fog = lock_state().manager.get(ModuleId::NoFog).clone();
+            let st = lock_state();
+            let no_fog = st.manager.get(ModuleId::NoFog).clone();
             visuals::apply_no_fog(&no_fog, event);
+            let now = host.millis();
+            vis_fx::apply_fog_data(&st.manager, &st.fx, now, event);
+        });
+    }
+
+    fn compute_fog_color(&self, host: &dyn ClientHost, event: &mut ComputeFogColorEvent<'_>) {
+        guard::run(&[ModuleId::VisSky, ModuleId::VisTrip], (), || {
+            if !mod_active(host) {
+                return;
+            }
+            let st = lock_state();
+            let theme = Theme::from_manager(&st.manager, host.millis());
+            vis_fx::apply_fog_color(&st.manager, &st.fx, &theme, host.millis(), event);
+        });
+    }
+
+    fn compute_fov(&self, host: &dyn ClientHost, event: &mut ComputeFovEvent) {
+        guard::run(&[ModuleId::VisCamera, ModuleId::VisTrip], (), || {
+            if !mod_active(host) {
+                return;
+            }
+            let st = lock_state();
+            vis_fx::apply_fov(&st.manager, &st.fx, &st.trackers, host.millis(), event);
+        });
+    }
+
+    fn camera_roll(&self, host: &dyn ClientHost, event: &mut CameraRollEvent) {
+        guard::run(&[ModuleId::VisCamera, ModuleId::VisTrip], (), || {
+            if !mod_active(host) {
+                return;
+            }
+            let st = lock_state();
+            vis_fx::apply_roll(&st.manager, &st.fx, host.millis(), event);
+        });
+    }
+
+    fn biome_colors(&self, host: &dyn ClientHost, event: &mut BiomeColorsEvent<'_>) {
+        guard::run(&[ModuleId::VisWorld, ModuleId::VisTrip], (), || {
+            if !mod_active(host) {
+                return;
+            }
+            let st = lock_state();
+            vis_fx::apply_biome_colors(&st.manager, &st.fx, host.millis(), event);
+        });
+    }
+
+    fn visuals(&self, host: &dyn ClientHost, event: &mut VisualsEvent<'_>) {
+        guard::run(&[ModuleId::VisWorld, ModuleId::VisTrip], (), || {
+            if !mod_active(host) {
+                return;
+            }
+            let st = lock_state();
+            let theme = Theme::from_manager(&st.manager, host.millis());
+            vis_fx::apply_visuals_lights(host, &st.manager, &st.fx, &theme, host.millis(), event);
+        });
+    }
+
+    fn shader_params(&self, host: &dyn ClientHost, event: &mut ShaderParamsEvent<'_>) {
+        guard::run(&[ModuleId::VisTrip], (), || {
+            if !mod_active(host) {
+                return;
+            }
+            let st = lock_state();
+            vis_fx::apply_shader_params(&st.manager, &st.fx, host.millis(), event);
+        });
+    }
+
+    fn render_level_stage(&self, host: &dyn ClientHost, event: &mut RenderLevelStageEvent<'_>) {
+        guard::run(&[ModuleId::VisSky, ModuleId::VisTrip], (), || {
+            if !mod_active(host) {
+                return;
+            }
+            let st = lock_state();
+            let theme = Theme::from_manager(&st.manager, host.millis());
+            vis_fx::draw_sky_dome(&st.manager, &st.fx, &theme, host.millis(), event);
         });
     }
 
@@ -520,12 +669,14 @@ impl mod_api::Hooks for Mod {
     }
 
     fn camera_shake(&self, host: &dyn ClientHost, event: &mut CameraShakeEvent<'_>) {
-        guard::run(&[ModuleId::Camera], (), || {
+        guard::run(&[ModuleId::Camera, ModuleId::VisCamera], (), || {
             if !mod_active(host) {
                 return;
             }
-            let cam = lock_state().manager.get(ModuleId::Camera).clone();
+            let st = lock_state();
+            let cam = st.manager.get(ModuleId::Camera).clone();
             visuals::apply_camera_shake(&cam, event);
+            vis_fx::apply_shake(&st.manager, &st.fx, host.millis(), event);
         });
     }
 
@@ -567,6 +718,16 @@ impl mod_api::Hooks for Mod {
                 return;
             }
             let mut st = lock_state();
+            let theme = Theme::from_manager(&st.manager, host.millis());
+            let now = host.millis();
+            vis_fx::draw_screen_overlays(
+                host,
+                event.draw,
+                &st.manager,
+                &st.fx,
+                &theme,
+                now,
+            );
             let ClientState {
                 manager,
                 interp,

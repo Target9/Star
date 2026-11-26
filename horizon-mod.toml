@@ -1,7 +1,7 @@
 id = "star"
 name = "Star"
-version = "0.3.0"
-description = "Meteor-inspired modular client with top-tab ClickGUI, font & theme customization, Entity Selector, Aim Assist, ESP, Tracers, Nametags, Radar, a draggable HUD, movement helpers, and visuals."
+version = "0.4.0"
+description = "Meteor-inspired modular client with top-tab ClickGUI, Visuals presets (PVP/LSD), font & theme customization, Entity Selector, Aim Assist, ESP, Tracers, Nametags, Radar, a draggable HUD, movement helpers, and visuals."
 authors = ["Target9"]
 license = "MIT"
 api = "0.2"
