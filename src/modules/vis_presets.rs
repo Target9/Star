@@ -350,7 +350,7 @@ const LSD: &[PresetWrite] = &[
     PresetWrite {
         module: "vis_preset",
         setting: "dose",
-        value: "1.25",
+        value: "1.15",
     },
     PresetWrite {
         module: "vis_sky",
@@ -360,7 +360,7 @@ const LSD: &[PresetWrite] = &[
     PresetWrite {
         module: "vis_sky",
         setting: "brightness",
-        value: "1.00",
+        value: "0.72",
     },
     PresetWrite {
         module: "vis_sky",
@@ -370,7 +370,7 @@ const LSD: &[PresetWrite] = &[
     PresetWrite {
         module: "vis_sky",
         setting: "fog_density",
-        value: "1.15",
+        value: "0.95",
     },
     PresetWrite {
         module: "vis_sky",
@@ -380,12 +380,12 @@ const LSD: &[PresetWrite] = &[
     PresetWrite {
         module: "vis_sky",
         setting: "fog_breath_amount",
-        value: "0.75",
+        value: "0.40",
     },
     PresetWrite {
         module: "vis_sky",
         setting: "night_boost",
-        value: "0.80",
+        value: "0.45",
     },
     PresetWrite {
         module: "vis_world",
@@ -400,7 +400,7 @@ const LSD: &[PresetWrite] = &[
     PresetWrite {
         module: "vis_world",
         setting: "saturation",
-        value: "1.75",
+        value: "1.55",
     },
     PresetWrite {
         module: "vis_world",
@@ -415,17 +415,17 @@ const LSD: &[PresetWrite] = &[
     PresetWrite {
         module: "vis_world",
         setting: "light_radius",
-        value: "12.0",
+        value: "8.0",
     },
     PresetWrite {
         module: "vis_world",
         setting: "light_intensity",
-        value: "0.95",
+        value: "0.55",
     },
     PresetWrite {
         module: "vis_camera",
         setting: "fov_offset",
-        value: "4.0",
+        value: "2.0",
     },
     PresetWrite {
         module: "vis_camera",
@@ -435,22 +435,22 @@ const LSD: &[PresetWrite] = &[
     PresetWrite {
         module: "vis_camera",
         setting: "sway",
-        value: "2.4",
+        value: "1.1",
     },
     PresetWrite {
         module: "vis_camera",
         setting: "roll",
-        value: "14.0",
+        value: "5.0",
     },
     PresetWrite {
         module: "vis_camera",
         setting: "hit_punch",
-        value: "1.4",
+        value: "0.8",
     },
     PresetWrite {
         module: "vis_screen",
         setting: "vignette",
-        value: "0.70",
+        value: "0.32",
     },
     PresetWrite {
         module: "vis_screen",
@@ -460,17 +460,17 @@ const LSD: &[PresetWrite] = &[
     PresetWrite {
         module: "vis_screen",
         setting: "wash",
-        value: "0.38",
+        value: "0.08",
     },
     PresetWrite {
         module: "vis_screen",
         setting: "scanlines",
-        value: "0.22",
+        value: "0.0",
     },
     PresetWrite {
         module: "vis_screen",
         setting: "edge_glow",
-        value: "0.85",
+        value: "0.18",
     },
     PresetWrite {
         module: "vis_screen",
@@ -480,7 +480,7 @@ const LSD: &[PresetWrite] = &[
     PresetWrite {
         module: "vis_screen",
         setting: "chroma_bars",
-        value: "0.55",
+        value: "0.0",
     },
     PresetWrite {
         module: "vis_hit",
@@ -495,7 +495,7 @@ const LSD: &[PresetWrite] = &[
     PresetWrite {
         module: "vis_hit",
         setting: "count",
-        value: "36",
+        value: "20",
     },
     PresetWrite {
         module: "vis_hit",
@@ -510,27 +510,27 @@ const LSD: &[PresetWrite] = &[
     PresetWrite {
         module: "vis_ambient",
         setting: "style",
-        value: "Geometric",
+        value: "Sparkles",
     },
     PresetWrite {
         module: "vis_ambient",
         setting: "density",
-        value: "22.0",
+        value: "7.0",
     },
     PresetWrite {
         module: "vis_ambient",
         setting: "radius",
-        value: "14.0",
+        value: "9.0",
     },
     PresetWrite {
         module: "vis_trip",
         setting: "onset",
-        value: "3.0",
+        value: "5.0",
     },
     PresetWrite {
         module: "vis_trip",
         setting: "wave_period",
-        value: "5.5",
+        value: "9.0",
     },
     PresetWrite {
         module: "vis_trip",
@@ -575,7 +575,7 @@ const LSD: &[PresetWrite] = &[
     PresetWrite {
         module: "vis_trip",
         setting: "audio_warp",
-        value: "true",
+        value: "false",
     },
     PresetWrite {
         module: "vis_trip",
@@ -585,7 +585,7 @@ const LSD: &[PresetWrite] = &[
     PresetWrite {
         module: "vis_trip",
         setting: "strength",
-        value: "1.75",
+        value: "1.25",
     },
 ];
 
@@ -955,7 +955,7 @@ pub const PRESET_CARDS: [PresetCard; 7] = [
     },
     PresetCard {
         name: "LSD",
-        blurb: "Full melt: morph waves, kaleidoscope, rainbow world.",
+        blurb: "Breathing world, colour shift, soft tracers.",
         swatch_a: 0xFFFF_4AD8,
         swatch_b: 0xFF4A_FF8A,
     },
@@ -1025,7 +1025,7 @@ mod tests {
 
         assert!(apply_preset_index(&mut mgr, 2) > 0);
         assert_eq!(mgr.get(ModuleId::VisPreset).mode_str("preset", ""), "LSD");
-        assert!((mgr.get(ModuleId::VisPreset).float("dose", 0.0) - 1.25).abs() < 1e-6);
+        assert!((mgr.get(ModuleId::VisPreset).float("dose", 0.0) - 1.15).abs() < 1e-6);
 
         let before = mgr.get(ModuleId::VisHit).bool("enabled_fx", false);
         assert_eq!(apply_preset_index(&mut mgr, 6), 0, "Custom is a no-op");

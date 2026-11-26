@@ -329,19 +329,19 @@ fn wave(now_ms: u64, period_s: f32) -> f32 {
     (t * std::f32::consts::TAU).sin() * 0.5 + 0.5
 }
 
-/// Signed multi-harmonic melt wave in [-1, 1] — feels like the world breathing.
+/// Slow smooth melt in [-1, 1] — LSD drifting is gradual, not jittery.
 fn morph_wave(now_ms: u64, period_s: f32) -> f32 {
     let t = now_ms as f32 / 1000.0;
-    let p = period_s.max(0.4);
+    let p = period_s.max(2.5);
     let a = ((t / p) * std::f32::consts::TAU).sin();
-    let b = ((t / (p * 0.37)) * std::f32::consts::TAU).sin() * 0.55;
-    let c = ((t / (p * 0.19)) * std::f32::consts::TAU).sin() * 0.28;
-    (a + b + c) / 1.83
+    let b = ((t / (p * 1.618)) * std::f32::consts::TAU).sin() * 0.4;
+    (a + b) / 1.4
 }
 
+/// Soft colour for enhancement / afterimages (pastel, not neon disco).
 fn trip_hue(time_ms: u64, offset: f32, speed: f32) -> u32 {
     let hue = ((time_ms as f32 * speed * 0.001) + offset).rem_euclid(1.0);
-    hsv_to_argb(hue, 0.92, 1.0, 0xFF)
+    hsv_to_argb(hue, 0.55, 1.0, 0xFF)
 }
 
 fn emit_hits(
@@ -704,14 +704,12 @@ pub fn apply_fov(
         let period = trip.float("wave_period", 12.0) as f32;
         let strength = trip.float("strength", 1.0) as f32;
         let dose = fx.trip_level * strength;
-        let morph_on = trip.bool("morph", true);
-        let slow = (wave(time_ms, period) - 0.5) * 2.0;
-        let heart = ((time_ms as f32 / 1000.0) * 1.55 * std::f32::consts::TAU).sin();
-        degrees += slow * 10.0 * dose + heart * 2.0 * dose;
-        if morph_on {
-            let melt = morph_wave(time_ms, period);
-            let flutter = ((time_ms as f32 / 1000.0) * 3.1 * std::f32::consts::TAU).sin();
-            degrees += melt * 16.0 * dose + flutter * 3.5 * dose;
+        // Room breathing: slow FOV pulse (world expands / contracts).
+        let breathe = morph_wave(time_ms, period);
+        degrees += breathe * 7.5 * dose;
+        if trip.bool("morph", true) {
+            // Second slower wave for melting depth, not chaotic flutter.
+            degrees += morph_wave(time_ms, period * 1.7) * 4.5 * dose;
         }
     }
     event.degrees = degrees.clamp(1.0, 179.0);
@@ -733,20 +731,16 @@ pub fn apply_roll(
         let period = trip.float("wave_period", 12.0) as f32;
         let strength = trip.float("strength", 1.0) as f32;
         let dose = fx.trip_level * strength;
-        roll += (wave(time_ms, period) - 0.5) * 2.0 * 16.0 * dose;
+        // Gentle horizon melt — slow, smooth, cartoon-like.
+        roll += morph_wave(time_ms, period) * 8.0 * dose;
         if trip.bool("morph", true) {
-            let melt = morph_wave(time_ms, period * 0.72);
-            let spin = ((time_ms as f32 / 1000.0) * 0.55 * std::f32::consts::TAU).sin();
-            roll += melt * 22.0 * dose + spin * 6.0 * dose;
+            roll += morph_wave(time_ms, period * 1.9) * 4.0 * dose;
         }
     }
     let sway = cam.float("sway", 0.0) as f32;
     if sway > 0.01 {
         let t = time_ms as f32 / 1000.0;
-        roll += (t * 0.7).sin() * sway;
-        if fx.trip_level > 0.05 && trip.bool("morph", true) {
-            roll += (t * 1.9).sin() * sway * 0.85 * fx.trip_level;
-        }
+        roll += (t * 0.45).sin() * sway * 0.65;
     }
     if roll.is_finite() {
         event.roll = (event.roll + roll).rem_euclid(360.0);
@@ -782,12 +776,10 @@ pub fn apply_shake(
         let period = trip.float("wave_period", 12.0) as f32;
         let strength = trip.float("strength", 1.0) as f32;
         let dose = fx.trip_level * strength;
-        let melt = morph_wave(time_ms, period);
-        let t = time_ms as f32 / 1000.0;
-        event.shake.pitch += melt * 1.8 * dose + (t * 2.4).sin() * 0.55 * dose;
-        event.shake.yaw += morph_wave(time_ms, period * 1.27) * 1.5 * dose
-            + (t * 1.7).cos() * 0.45 * dose;
-        event.shake.roll += melt * 2.2 * dose;
+        // Soft drifting — objects feel like they're breathing without shake spam.
+        event.shake.pitch += morph_wave(time_ms, period) * 0.55 * dose;
+        event.shake.yaw += morph_wave(time_ms, period * 1.35) * 0.45 * dose;
+        event.shake.roll += morph_wave(time_ms, period * 1.8) * 0.7 * dose;
     }
     if fx.punch_yaw.abs() > 0.01 || fx.punch_pitch.abs() > 0.01 {
         event.shake.yaw += fx.punch_yaw;
@@ -814,11 +806,12 @@ pub fn apply_biome_colors(
     let sat = world.float("saturation", 1.0) as f32;
     let (grass, foliage, water) = if rainbow {
         let hash = fnv1a(event.biome);
-        let speed = if fx.trip_level > 0.05 { 0.085 } else { 0.02 };
+        // Slow colour-shifting, not a disco light show.
+        let speed = if fx.trip_level > 0.05 { 0.028 } else { 0.012 };
         let base = ((time_ms as f32 * speed) + (hash as f32) * 0.0000001).rem_euclid(1.0);
-        let g = hsv_to_argb(base, (0.78 * sat).clamp(0.0, 1.0), 0.95, 0xFF);
-        let f = hsv_to_argb((base + 0.18) % 1.0, (0.82 * sat).clamp(0.0, 1.0), 0.9, 0xFF);
-        let w = hsv_to_argb((base + 0.55) % 1.0, (0.7 * sat).clamp(0.0, 1.0), 1.0, 0xFF);
+        let g = hsv_to_argb(base, (0.62 * sat).clamp(0.0, 1.0), 0.88, 0xFF);
+        let f = hsv_to_argb((base + 0.08) % 1.0, (0.58 * sat).clamp(0.0, 1.0), 0.82, 0xFF);
+        let w = hsv_to_argb((base + 0.45) % 1.0, (0.5 * sat).clamp(0.0, 1.0), 0.9, 0xFF);
         (g, f, w)
     } else {
         (
